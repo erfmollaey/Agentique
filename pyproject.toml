@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-research-bot"
+version = "1.0.0"
+description = "Telegram AI Research Bot — Phase 1 core infrastructure"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error::RuntimeWarning",
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# E501: line length is handled by the formatter, not the linter.
+# RUF001/2/3: Persian user-facing text legitimately contains letters that are
+#   visually confusable with Latin ones (e.g. Arabic letter heh vs Latin o).
+#   The product's primary language is Persian, so the check is disabled rather
+#   than silenced file by file.
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = false
+ignore_missing_imports = true
+disallow_untyped_defs = false

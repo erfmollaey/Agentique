@@ -1,0 +1,47 @@
+# Runtime dependencies.
+#
+# Every module imported under app/ has an entry here. Verified against a clean
+# install (Phase 1 FR-2.1, FR-2.2, T-13).
+
+# --- Web / API ---
+fastapi==0.115.6
+# Justified: the ASGI server. Not imported by app/ because it is the process
+# entry point invoked as `uvicorn app.main:app`, not as a library.
+uvicorn[standard]==0.34.0
+
+# --- Telegram ---
+aiogram==3.17.0
+
+# --- Background tasks ---
+celery==5.4.0
+# Justified: no application module imports `redis` directly, but Celery's
+# Redis broker transport requires it at runtime. Kept as an explicit pin so the
+# broker dependency is visible rather than incidental.
+redis==5.2.0
+
+# --- Configuration ---
+pydantic==2.10.6
+pydantic-settings==2.7.0
+# `python-dotenv` is deliberately not pinned: pydantic-settings declares it as
+# a hard requirement, and the `env_file` support this project relies on comes
+# from it.
+# `httpx` is deliberately not pinned: the openai SDK declares it as a hard
+# requirement and it is used for all provider HTTP traffic.
+
+# --- AI provider (OpenAI-compatible) ---
+# Added in Phase 1. Was imported by app/ but undeclared, so a clean environment
+# could not start the application (audit C-2).
+openai==2.44.0
+
+# --- Reserved for Phase 2 (data layer) ---
+# No application module imports these yet; there is no database code in
+# Phase 1 (audit M-2). Both are reserved, not removed, so Phase 2 does not
+# have to re-introduce the data layer from scratch.
+# asyncpg: reserved for Phase 2, the async PostgreSQL driver.
+asyncpg==0.30.0
+# sqlalchemy: reserved for Phase 2, the ORM and migration target.
+sqlalchemy==2.0.36
+
+
+# --- Test dependencies ---
+# Phase 1 P1-14. Kept in a separate file consumed by requirements-dev.txt.

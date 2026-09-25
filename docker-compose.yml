@@ -1,0 +1,99 @@
+# Phase 1 local development stack.
+#
+# The two application services (api, worker) plus the infrastructure they need.
+# This is a local development topology, not production: no TLS termination,
+# no secrets manager, no orchestration (Phase 8 territory).
+#
+# Credentials come from .env via env_file. There are no default passwords in
+# this file (FR-10.5, SR-8).
+
+name: telegram-research-bot
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+    # Inside the compose network the broker is the service name, not localhost.
+    REDIS_URL: redis://redis:6379/0
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Bound to loopback only: not exposed on the host network interface.
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    # No default credentials. POSTGRES_PASSWORD must be supplied via .env.
+    # Declared for Phase 2; no application code connects to it in Phase 1.
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-research_db}
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --no-access-log
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      # Liveness only: cheap and local. /ready probes the broker.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    <<: *app
+    # --pool=prefork is the default and is what the per-process event loop
+    # fix (audit C-3) is designed for. --concurrency=1 keeps one task at a
+    # time per worker so the long-lived loop is unambiguous in development.
+    command: >
+      celery -A app.core.celery_app:celery_app worker
+      --loglevel=INFO
+      --concurrency=1
+      --pool=prefork
+    healthcheck:
+      # Celery exposes a ping; disabled by default in the worker.
+      test: ["CMD", "celery", "-A", "app.core.celery_app:celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  redis_data:
+  pg_data:
