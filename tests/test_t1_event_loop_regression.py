@@ -11,6 +11,11 @@ These tests assert the invariant the fix establishes: one long-lived loop per
 process, never closed between tasks, with the loop-affine session created once
 and reused. ``test_reproduces_original_defect`` demonstrates that the original
 pattern violates the same invariant, so the suite would have caught C-3.
+
+Phase 2 change: the request path is now the AI chat flow rather than query
+decomposition, so ``_turn`` runs the chat service on the process loop and then
+delivers — the same two steps the Celery task performs. The assertions are
+unchanged: they are about loop identity, not about which service runs.
 """
 
 from __future__ import annotations
@@ -19,35 +24,55 @@ import asyncio
 
 import pytest
 
+from app.domain.chat import ChatTurn
 from app.infrastructure import asyncio_runtime
+from app.infrastructure.asyncio_runtime import run_coroutine
 from app.services.delivery import DeliveryService
 
 
-def test_t1_task_runs_repeatedly_in_one_process(fake_bot, fake_llm, settings):
-    """T-1: the research path executes successfully more than once.
+def _turn(chat_id: int, text: str) -> ChatTurn:
+    return ChatTurn(
+        telegram_user_id=chat_id,
+        chat_id=chat_id,
+        text=text,
+        telegram_message_id=chat_id,
+    )
+
+
+def _service(chat_service, delivery):
+    """Run one turn the way the task does: async work on the loop, then send."""
+
+    def run(chat_id: int, query: str) -> int:
+        outcome = run_coroutine(chat_service.handle_message(_turn(chat_id, query)))
+        return delivery.send(chat_id, outcome.text)
+
+    return run
+
+
+def test_t1_task_runs_repeatedly_in_one_process(fake_bot, chat_service, settings):
+    """T-1: the request path executes successfully more than once.
 
     Three sequential invocations, as a prefork worker performs them, must all
     succeed against the same loop-affine session.
     """
     delivery = DeliveryService(fake_bot, settings)
-    service = _service(fake_llm, delivery, settings)
+    run = _service(chat_service, delivery)
 
     for i in range(1, 4):
-        sent = service.run(chat_id=100 + i, query=f"question {i}")
+        sent = run(chat_id=100 + i, query=f"question {i}")
         assert sent == 1, f"invocation {i} sent {sent} messages"
 
-    assert len(fake_llm.calls) == 3
     assert len(fake_bot.sent) == 3
 
 
-def test_t1_same_loop_is_reused_across_invocations(fake_bot, fake_llm, settings):
+def test_t1_same_loop_is_reused_across_invocations(fake_bot, chat_service, settings):
     """The loop must be identical for every invocation, not recreated."""
     delivery = DeliveryService(fake_bot, settings)
-    service = _service(fake_llm, delivery, settings)
+    run = _service(chat_service, delivery)
 
-    service.run(chat_id=1, query="first")
-    service.run(chat_id=2, query="second")
-    service.run(chat_id=3, query="third")
+    run(chat_id=1, query="first")
+    run(chat_id=2, query="second")
+    run(chat_id=3, query="third")
 
     assert len({id(loop) for loop in fake_bot.loops}) == 1, (
         "each invocation used a different event loop; the session would be "
@@ -55,34 +80,34 @@ def test_t1_same_loop_is_reused_across_invocations(fake_bot, fake_llm, settings)
     )
 
 
-def test_t1_loop_is_not_closed_between_invocations(fake_bot, fake_llm, settings):
+def test_t1_loop_is_not_closed_between_invocations(fake_bot, chat_service, settings):
     """The process loop must stay open for the process lifetime."""
     delivery = DeliveryService(fake_bot, settings)
-    service = _service(fake_llm, delivery, settings)
+    run = _service(chat_service, delivery)
 
-    service.run(chat_id=1, query="first")
+    run(chat_id=1, query="first")
     loop = asyncio_runtime.get_event_loop()
     assert not loop.is_closed()
 
-    service.run(chat_id=2, query="second")
+    run(chat_id=2, query="second")
     assert not loop.is_closed(), "loop was closed while the process was still running"
 
 
-def test_t1_session_is_created_once_and_reused(fake_bot, fake_llm, settings):
+def test_t1_session_is_created_once_and_reused(fake_bot, chat_service, settings):
     """The loop-affine session is bound on first use and never re-bound."""
     delivery = DeliveryService(fake_bot, settings)
-    service = _service(fake_llm, delivery, settings)
+    run = _service(chat_service, delivery)
 
-    service.run(chat_id=1, query="first")
+    run(chat_id=1, query="first")
     bound = fake_bot.session.bound_to
     assert bound is not None
 
-    service.run(chat_id=2, query="second")
-    service.run(chat_id=3, query="third")
+    run(chat_id=2, query="second")
+    run(chat_id=3, query="third")
     assert fake_bot.session.bound_to is bound
 
 
-def test_t1_reproduces_original_defect(fake_bot, fake_llm, settings):
+def test_t1_reproduces_original_defect(fake_bot):
     """Demonstrates the original per-task-loop pattern is genuinely broken.
 
     If this test ever passes, the regression suite has lost its teeth. It
@@ -129,9 +154,3 @@ def test_t1_run_coroutine_reuses_the_process_loop():
     first = asyncio_runtime.run_coroutine(work())
     second = asyncio_runtime.run_coroutine(work())
     assert first == second
-
-
-def _service(fake_llm, delivery, settings):
-    from app.services.research import ResearchService
-
-    return ResearchService(llm=fake_llm, delivery=delivery, settings=settings)

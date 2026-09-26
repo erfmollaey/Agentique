@@ -62,12 +62,11 @@ def enqueued(monkeypatch):
 
 
 @pytest.fixture
-def dispatcher(settings, fake_llm):
+def dispatcher(settings, fake_llm, chat_service):
     """Return ``(dispatcher, bot)``; the Bot is not reachable from Dispatcher."""
     from app.bot.container import AppContainer
     from app.services.delivery import DeliveryService
     from app.services.rate_limit import RateLimiter
-    from app.services.research import ResearchService
 
     dp = Dispatcher()
     bot = Bot(token=FAKE_TOKEN)
@@ -78,8 +77,9 @@ def dispatcher(settings, fake_llm):
         dispatcher=dp,
         llm=fake_llm,
         delivery=delivery,
-        research=ResearchService(fake_llm, delivery, settings),
         rate_limiter=RateLimiter(settings),
+        database=None,
+        chat=chat_service,
     )
     register_handlers(dp, container)
     return dp, bot
@@ -119,7 +119,10 @@ async def test_unknown_command_is_answered_not_enqueued(dispatcher, enqueued, se
 
     assert enqueued == [], "an unknown command was treated as free text"
     assert len(sent) == 1
-    assert "Unknown command" in sent[0]["text"]
+    # Phase 2 FR-18: a helpful response listing a way forward. The wording is
+    # user-facing copy, so the assertion is on the contract (it names /help and
+    # does not become free text), not on an exact string.
+    assert "/help" in sent[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -148,7 +151,16 @@ async def test_text_is_enqueued_with_distinct_chat_and_user_ids(dispatcher, enqu
     await _feed(dp, bot, _update(text="what is entropy?", chat_id=-100999, user_id=555))
 
     assert len(enqueued) == 1
-    assert enqueued[0] == {"chat_id": -100999, "user_id": 555, "query": "what is entropy?"}
+    # Phase 2 adds username and telegram_message_id to the payload: the first
+    # for the user record, the second for turn-id derivation, which is what
+    # makes update redelivery idempotent.
+    assert enqueued[0] == {
+        "chat_id": -100999,
+        "user_id": 555,
+        "query": "what is entropy?",
+        "username": None,
+        "telegram_message_id": 1,
+    }
     assert enqueued[0]["chat_id"] != enqueued[0]["user_id"]
     assert len(sent) == 1, "user did not receive the acknowledgement"
 
@@ -206,7 +218,7 @@ async def test_broker_failure_produces_a_user_visible_message(dispatcher, monkey
 # per user per window and 2 concurrent in-flight requests.
 
 @pytest.mark.asyncio
-async def test_global_capacity_is_enforced_and_explained(dispatcher, sent):
+async def test_global_capacity_is_enforced_and_explained(dispatcher, enqueued, sent):
     """With MAX_IN_FLIGHT_REQUESTS=2 and no task run, the 3rd is refused."""
     dp, bot = dispatcher
 
@@ -221,7 +233,7 @@ async def test_global_capacity_is_enforced_and_explained(dispatcher, sent):
 
 
 @pytest.mark.asyncio
-async def test_user_rate_limit_is_enforced_after_allowance(dispatcher, sent):
+async def test_user_rate_limit_is_enforced_after_allowance(dispatcher, enqueued, sent):
     """With capacity released each turn, the per-user limit trips on the 4th."""
     dp, bot = dispatcher
     container = _container_of(dp)

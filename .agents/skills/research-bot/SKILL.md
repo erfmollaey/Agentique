@@ -4,6 +4,21 @@
 
 **Ground truth:** [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) — the verified audit. If this skill and the audit disagree, the audit wins.
 
+> ## ⚠️ THIS FILE IS THE PRE-PHASE-1 BRIEFING — IT IS STALE
+>
+> It describes the repository before Phase 1: "zero tests", "no service layer",
+> "no database code", active phase 1 *Not Started*. All of that is now wrong.
+>
+> **Read these instead, in this order, before writing code:**
+> 1. [`docs/DEVELOPMENT_RULES.md`](../../../docs/DEVELOPMENT_RULES.md) — mandatory rules
+> 2. [`docs/PROJECT_PLAN.md`](../../../docs/PROJECT_PLAN.md) — active phase, status tables, decision log (AD-001 … AD-027)
+> 3. [`docs/phases/PHASE-02-AI-CHAT.md`](../../../docs/phases/PHASE-02-AI-CHAT.md) § 14 — current implementation record, limitations, and open blockers
+> 4. [`../../README.md`](../../README.md) — how to run it
+>
+> The audit content below is retained unmodified as the historical baseline. Its
+> line numbers and "NOT CONNECTED" diagrams describe code that no longer exists.
+> Everything below the line has not been updated and should be read as history.
+
 ---
 
 ## Purpose

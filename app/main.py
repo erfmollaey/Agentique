@@ -111,8 +111,9 @@ async def health() -> dict[str, str]:
 async def ready(response: Response) -> dict[str, object]:
     """Readiness: can this process actually serve requests?
 
-    Probes the poller and the broker. Returns 503 when either is unavailable,
-    so a dead bot cannot report healthy (FR-7.2, FR-7.3, T-11).
+    Probes the poller, the broker, and — as of Phase 2 — the database. Returns
+    503 when any is unavailable, so a dead bot cannot report healthy
+    (FR-7.2, FR-7.3, T-11).
     """
     from app.core.celery_app import celery_app
 
@@ -122,7 +123,16 @@ async def ready(response: Response) -> dict[str, object]:
             SETTINGS.HEALTH_PROBE_TIMEOUT_SECONDS,
         )
 
-    report = readiness_report(broker_check, _poller_alive)
+    # The endpoint is already inside the running loop, so the probe is awaited
+    # directly rather than driven through the process-loop bridge.
+    database = getattr(getattr(app.state, "container", None), "database", None)
+    database_ok = (
+        await database.ping(SETTINGS.HEALTH_PROBE_TIMEOUT_SECONDS)
+        if database is not None
+        else False
+    )
+
+    report = readiness_report(broker_check, _poller_alive, lambda: database_ok)
     if not report.healthy:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {"status": report.status, "checks": report.checks}

@@ -19,9 +19,16 @@ from app.core.config import ENV_FILE, PROJECT_ROOT, ConfigurationError, Settings
 ROOT = Path(__file__).resolve().parents[1]
 
 # Matches a Telegram bot token or a provider key shape.
+#
+# The Groq alternative is ``gsk_`` with an UNDERSCORE, which is what Groq issues.
+# It was previously written ``gsk-`` with a hyphen, which matched nothing: a real
+# Groq key slipped through this scanner and the CI secret scan unnoticed. A
+# scanner that cannot fail is not a control, so
+# ``test_the_secret_scanner_matches_realistic_key_shapes`` now pins the shapes
+# this pattern must catch.
 SECRET_PATTERN = re.compile(
-    r"sk-[A-Za-z0-9_-]{16,}"          # provider keys (sk-..., sk-or-v1-...)
-    r"|gsk-[A-Za-z0-9_-]{16,}"        # Groq provider keys
+    r"sk-[A-Za-z0-9_-]{16,}"              # OpenAI-style (sk-..., sk-or-v1-...)
+    r"|gsk_[A-Za-z0-9_-]{16,}"            # Groq (gsk_...)
     r"|\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"  # Telegram bot tokens
 )
 
@@ -81,7 +88,13 @@ def test_sr3_env_example_exists_and_contains_no_real_values():
         "redis://localhost",
         "postgresql+asyncpg://USER:PASSWORD@",
         "https://api.groq.com/openai/v1",
-        "llama-3.3-70b-versatile",
+        "qwen/qwen3.8-27b",
+        # A documented enum value, not a credential.
+        "openai_compatible",
+        # An explicit placeholder, not a chosen password; and a database name.
+        "USER",
+        "PASSWORD",
+        "research_db",
     )
     for line in content.splitlines():
         line = line.strip()
@@ -171,12 +184,145 @@ def test_t10_settings_expose_llm_and_reliability_configuration(settings):
     assert settings.TELEGRAM_MAX_MESSAGE_LENGTH <= 4096
 
 
-def test_t10_database_url_is_optional():
-    """DATABASE_URL has no consumer in Phase 1, so it cannot block startup."""
+def test_t10_database_url_is_required_and_optional_settings_stay_optional():
+    """Phase 2 inverted the Phase 1 rule for DATABASE_URL.
+
+    It was optional in Phase 1 precisely because nothing consumed it. Phase 2
+    wires it into a real engine, so a missing value must stop the process at
+    startup rather than surface as a failure on the first user message. The
+    neighbouring assertions guard the opposite direction: genuinely optional
+    settings must stay optional, or the process cannot start on a minimal
+    environment.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as info:
+        Settings(
+            _env_file=None,
+            BOT_TOKEN="1:TEST",
+            GROQ_API_KEY="gsk-test",
+            REDIS_URL="redis://localhost:6379/15",
+        )
+    assert "DATABASE_URL" in str(info.value)
+
     s = Settings(
         _env_file=None,
         BOT_TOKEN="1:TEST",
         GROQ_API_KEY="gsk-test",
         REDIS_URL="redis://localhost:6379/15",
+        DATABASE_URL="postgresql+asyncpg://u:p@localhost:5432/chat_test",
     )
-    assert s.DATABASE_URL is None, "an unused variable is still mandatory"
+    assert s.DATABASE_URL.endswith("chat_test")
+    assert s.TEST_DATABASE_URL is None, "an unused variable is still mandatory"
+
+
+# --- The scanner itself must be able to fail --------------------------------
+#
+# Found during the Phase 2 completion pass: every secret scanner in the
+# repository used ``gsk-`` with a HYPHEN, while Groq issues ``gsk_`` with an
+# UNDERSCORE. The pattern therefore matched no real Groq key, and this test file
+# passed while a realistic key sat in `app/`. A control that cannot fail is not a
+# control, so the shapes are pinned here.
+
+# Realistic shapes, with the secret part obviously synthetic.
+_GROQ_KEY = "gsk_" + "A1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvWxYz0123456789Ab"
+_OPENAI_KEY = "sk-" + "A1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvWx"
+_OPENROUTER_KEY = "sk-or-v1-" + "A1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvWx"
+_TELEGRAM_TOKEN = "1234567890:" + "A1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvWxY"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [_GROQ_KEY, _OPENAI_KEY, _OPENROUTER_KEY, _TELEGRAM_TOKEN],
+    ids=["groq", "openai", "openrouter", "telegram"],
+)
+def test_the_secret_scanner_matches_realistic_key_shapes(secret):
+    assert SECRET_PATTERN.search(secret), (
+        "the scanner does not match this credential family; a scanner that "
+        "cannot fail is not a control"
+    )
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        "SKETCH=1",
+        "task_id=1aa2660ba631cb43e9975a5361942b70",
+        "postgres://user:password@localhost:5432/db",
+        "https://api.groq.com/openai/v1",
+        "gsk_",
+        "sk-",
+    ],
+)
+def test_the_secret_scanner_does_not_match_benign_text(benign):
+    """A scanner that cries wolf gets switched off, which is worse."""
+    assert not SECRET_PATTERN.search(benign), f"false positive on {benign!r}"
+
+
+def test_the_repository_wide_scan_also_matches_a_groq_key():
+    """The structural test's own pattern must have the same coverage."""
+    import ast
+
+    source = (ROOT / "tests" / "test_dependencies_and_structure.py").read_text()
+    tree = ast.parse(source)
+    patterns = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and "gsk" in node.value
+    ]
+    assert patterns, "the gsk_ pattern is missing from the repository scan"
+    for pattern in patterns:
+        compiled = re.compile(pattern)
+        assert compiled.search(_GROQ_KEY), (
+            f"the repository scan cannot match a Groq key: {pattern!r}"
+        )
+
+
+# --- Logging configuration must not destroy other listeners (P2-9) ---------
+
+def test_configure_logging_preserves_handlers_other_components_attached():
+    """Found during Phase 2 completion.
+
+    ``configure_logging`` used to call ``root.handlers.clear()``, which silently
+    removed any handler something else had attached — including a test
+    framework's capture handler. Records still reached the console, so nothing
+    looked broken, but every other listener went deaf. A Phase 2 security
+    assertion (SR-5) then passed or failed depending on module import order.
+    """
+    import logging
+
+    from app.core.logging_config import _RedactingFilter  # noqa: F401  documents intent
+
+    root = logging.getLogger()
+    sentinel = logging.NullHandler()
+    root.addHandler(sentinel)
+    try:
+        import app.core.logging_config as logging_config
+
+        logging_config._CONFIGURED = False
+        logging_config.configure_logging()
+        assert sentinel in root.handlers, (
+            "configure_logging removed a handler it did not own; other "
+            "components' log listeners are silently destroyed"
+        )
+    finally:
+        root.removeHandler(sentinel)
+        import app.core.logging_config as logging_config
+
+        # Leave the process in the configured state for later tests.
+        logging_config._CONFIGURED = True
+
+
+def test_configure_logging_is_still_idempotent():
+    """FR-9.1 is provided by the guard, not by clearing handlers."""
+    import logging
+
+    import app.core.logging_config as logging_config
+
+    before = list(logging.getLogger().handlers)
+    logging_config.configure_logging()
+    logging_config.configure_logging()
+    assert logging.getLogger().handlers == before, (
+        "repeated calls changed the handler set; the app must not duplicate output"
+    )

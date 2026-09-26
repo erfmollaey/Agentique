@@ -18,9 +18,8 @@ from app.domain.errors import (
     LLMServiceError,
     LLMTimeoutError,
 )
-from app.domain.schemas import QueryAnalysis
+from app.infrastructure.asyncio_runtime import run_coroutine
 from app.infrastructure.llm import OpenAICompatibleClient
-from app.services.research import ResearchService
 
 
 def _client(settings: Settings, content, raise_exc: Exception | None = None):
@@ -139,16 +138,29 @@ def test_t8_authentication_error_does_not_leak_provider_text(settings):
     assert "SHOULD-NOT-APPEAR" not in str(info.value)
 
 
-def test_t8_llm_failure_still_delivers_a_user_message(fake_bot, settings):
+def test_t8_llm_failure_still_delivers_a_user_message(fake_bot, settings, chat_service):
+    """The task must be able to turn a provider failure into a user message."""
     from app.domain.errors import LLMServiceError
+    from app.services.chat import ChatService
+    from app.services.context import ContextBuilder
     from app.services.delivery import DeliveryService
+    from app.services.failures import user_message_for
     from tests.conftest import FakeLLMClient
+    from tests.fakes import in_memory_uow_factory, user_turn
 
-    llm = FakeLLMClient(error=LLMServiceError("provider down"))
+    factory, _store = in_memory_uow_factory()
+    service = ChatService(
+        settings=settings,
+        llm=FakeLLMClient(error=LLMServiceError("provider down")),
+        uow_factory=factory,
+        context=ContextBuilder(settings),
+    )
     delivery = DeliveryService(fake_bot, settings)
-    service = ResearchService(llm=llm, delivery=delivery, settings=settings)
 
-    service.run(chat_id=42, query="q")
+    try:
+        run_coroutine(service.handle_message(user_turn(1, 42, "q", 1)))
+    except LLMServiceError as exc:
+        delivery.send(42, user_message_for(exc))
 
     assert len(fake_bot.sent) == 1, "user received no terminal response"
     text = fake_bot.sent[0][1]
@@ -158,56 +170,72 @@ def test_t8_llm_failure_still_delivers_a_user_message(fake_bot, settings):
 
 
 def test_t8_unexpected_exception_still_delivers_a_message(fake_bot, settings):
+    """An untyped error must not escape without a user-visible outcome."""
+    from app.services.chat import ChatService
+    from app.services.context import ContextBuilder
     from app.services.delivery import DeliveryService
+    from app.services.failures import user_message_for
     from tests.conftest import FakeLLMClient
+    from tests.fakes import in_memory_uow_factory, user_turn
 
-    llm = FakeLLMClient(error=ZeroDivisionError("boom"))
+    factory, _store = in_memory_uow_factory()
+    service = ChatService(
+        settings=settings,
+        llm=FakeLLMClient(error=ZeroDivisionError("boom")),
+        uow_factory=factory,
+        context=ContextBuilder(settings),
+    )
     delivery = DeliveryService(fake_bot, settings)
-    service = ResearchService(llm=llm, delivery=delivery, settings=settings)
 
-    service.run(chat_id=42, query="q")
+    try:
+        run_coroutine(service.handle_message(user_turn(1, 42, "q", 1)))
+    except Exception as exc:
+        delivery.send(42, user_message_for(exc))
+
     assert len(fake_bot.sent) == 1
     assert "Traceback" not in fake_bot.sent[0][1]
 
 
-def test_t8_every_message_gets_exactly_one_terminal_response(fake_bot, settings):
-    """FR-3.4: a result or a failure notice, never silence, never two replies."""
+def test_t8_every_message_gets_exactly_one_terminal_response(
+    fake_bot, settings, chat_service
+):
+    """FR-3.4, FR-21: a result or a failure notice, never silence, never two."""
     from app.services.delivery import DeliveryService
+    from tests.fakes import user_turn
 
     delivery = DeliveryService(fake_bot, settings)
-
-    service = ResearchService(llm=_OkLLM(), delivery=delivery, settings=settings)
-    service.run(chat_id=1, query="q")
+    outcome = run_coroutine(chat_service.handle_message(user_turn(1, 1, "q", 1)))
+    delivery.send(1, outcome.text)
     assert len(fake_bot.sent) == 1
 
     from app.domain.errors import LLMTimeoutError
+    from app.services.chat import ChatService
+    from app.services.context import ContextBuilder
+    from app.services.failures import user_message_for
     from tests.conftest import FakeLLMClient
+    from tests.fakes import in_memory_uow_factory
 
-    failing = ResearchService(
-        llm=FakeLLMClient(error=LLMTimeoutError("t")),
-        delivery=DeliveryService(fake_bot, settings),
+    factory, _store = in_memory_uow_factory()
+    failing = ChatService(
         settings=settings,
+        llm=FakeLLMClient(error=LLMTimeoutError("t")),
+        uow_factory=factory,
+        context=ContextBuilder(settings),
     )
-    failing.run(chat_id=2, query="q")
+    try:
+        run_coroutine(failing.handle_message(user_turn(2, 2, "q", 2)))
+    except LLMTimeoutError as exc:
+        delivery.send(2, user_message_for(exc))
     assert len(fake_bot.sent) == 2
 
 
 def test_user_message_never_contains_credentials(fake_bot, settings):
+    from app.domain.errors import LLMAuthenticationError
     from app.services.delivery import DeliveryService
-    from tests.conftest import FakeLLMClient
+    from app.services.failures import user_message_for
 
-    llm = FakeLLMClient(error=LLMAuthenticationError("bad key"))
-    service = ResearchService(
-        llm=llm,
-        delivery=DeliveryService(fake_bot, settings),
-        settings=settings,
-    )
-    service.run(chat_id=1, query="q")
+    delivery = DeliveryService(fake_bot, settings)
+    delivery.send(1, user_message_for(LLMAuthenticationError("bad key")))
     text = fake_bot.sent[0][1]
     assert settings.BOT_TOKEN.get_secret_value() not in text
     assert settings.GROQ_API_KEY.get_secret_value() not in text
-
-
-class _OkLLM:
-    def analyze_query(self, user_query: str) -> QueryAnalysis:
-        return QueryAnalysis(summary="s", sub_questions=["a"])

@@ -18,6 +18,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY alembic.ini ./alembic.ini
 COPY pyproject.toml ./
 
 # Run as a non-root user.

@@ -15,26 +15,35 @@
 
 ## Current Project Status
 
-**Current Phase:** Phase 1 — Core Infrastructure & Stabilization
-**Status:** IN PROGRESS — implementation and validation complete; blocked on manual credential rotation and two environment gates
+**Current Phase:** Phase 2 — AI Chat MVP
+**Status:** COMPLETE, with environmental verification limitations. Telegram delivery, GitHub Actions execution, and the verbatim `docker build` could not be exercised here. **An open human action remains outside this phase: Phase 1 credential rotation (P0-3/SR-4) — the key in `.env` is confirmed live, so the disclosure is real.**
 
 **Current implementation maturity:**
 
 | Area | Status | Change |
 |---|---|---|
-| Telegram integration | Partial | Chat id bug, message filtering, and error handling fixed; still long-polling only with no conversation state |
-| FastAPI backend | Partial | Lifespan lifecycle and honest health endpoints; no service-independent domain model beyond the minimal layer now added |
-| Celery | Partial | Time limits, acks-late, bounded retry, result retention; single-queue, no routing |
+| Telegram integration | Implemented | Text, `/start`, `/help`, `/new`, `/conversations`, `/reset`; long-polling transport unchanged; replies target the originating chat |
+| FastAPI backend | Partial | Lifespan lifecycle, `/health`, `/ready` now probing the broker **and** the database; no API surface beyond health |
+| Celery | Partial | Time limits, acks-late, bounded retry, result retention; single-queue, no routing; the task now runs the chat service |
 | Redis | Partial | Broker healthy and probed by `/ready`; no authentication |
-| PostgreSQL | Declared but not implemented | Unchanged — no database code; Phase 2 |
-| LLM integration | Partial | Credentials, endpoint, model, timeout, token limit, and validation are all configuration now; still a single hardcoded provider with no fallback chain |
-| Conversation persistence | Not implemented | Unchanged — Phase 2 |
+| PostgreSQL | **Implemented** | Was "Declared but not implemented". Three tables, Alembic migrations, constraints, indexes; `/ready` probes it |
+| LLM integration | Implemented | Credentials, endpoint, model, timeout, token limit, validation, usage capture, and a bounded fallback chain are configuration; one provider implementation behind a factory. **Verified against the live provider** — see `AD-028` |
+| Conversation persistence | **Implemented** | Was "Not implemented". Users, conversations, and messages persist and survive a restart |
 | Web research | Not implemented | Unchanged — Phase 3 |
 | File intelligence | Not implemented | Unchanged — Phase 4 |
-| Research workspace | Not implemented | Unchanged — Phase 5 |
+| Research workspace | Not implemented | Unchanged — Phase 5. A `conversations.project_id` column is reserved for it (AD-015) |
 | Agent orchestration | Skeleton only | Unchanged — Phase 6 |
 | SaaS | Not implemented | Unchanged — Phase 8 |
-| Tests | **Implemented** | Was "Not implemented". 123 tests, `ruff` and `mypy` clean |
+| Tests | **Implemented** | Was "Not implemented". **368 tests**, `ruff` and `mypy` clean; database tests run against a real PostgreSQL |
+
+**Not improved by Phase 2, deliberately:** the product still performs no
+research. Phase 2 made the bot hold a persistent conversation. It did not add
+search, sources, or citations.
+
+**Phase 2 completion evidence** is recorded in
+[`phases/PHASE-02-AI-CHAT.md`](./phases/PHASE-02-AI-CHAT.md) § 14: the
+requirement matrix, the validation table, the real end-to-end run against the live
+provider, and an explicit list of what could not be verified here.
 
 **Not improved by Phase 1, deliberately:** the product still performs no
 research. Phase 1 made the existing flow reliable, secure, and testable; it did
@@ -64,7 +73,7 @@ Taken directly from the audit's readiness table and section 3:
 | Phase | Name                                | Status                      | Main Goal                         |
 | ----- | ----------------------------------- | --------------------------- | --------------------------------- |
 | 1     | Core Infrastructure & Stabilization | In Progress                 | Make current system reliable      |
-| 2     | AI Chat MVP                         | Not Started                 | Build reliable conversational AI  |
+| 2     | AI Chat MVP                         | Complete                    | Build reliable conversational AI  |
 | 3     | Research Engine                     | Not Started                 | Web research pipeline             |
 | 4     | File Intelligence                   | Not Started                 | Document intelligence             |
 | 5     | Research Workspace                  | Not Started                 | Persistent research environment   |
@@ -153,7 +162,7 @@ This phase covers the existing foundational problems identified by the audit:
 
 **Full specification:** [`phases/PHASE-02-AI-CHAT.md`](./phases/PHASE-02-AI-CHAT.md)
 
-### Current implementation (from audit)
+### Current implementation (from audit, before this phase)
 
 - A single-turn LLM call that decomposes one user message into a summary and 2–3 sub-questions (`app/agents/supervisor.py:16-44`).
 - No conversation memory. `analyze_query` receives exactly one string.
@@ -161,18 +170,22 @@ This phase covers the existing foundational problems identified by the audit:
 - One command (`/start`) and one unfiltered catch-all handler.
 - No streaming, no model selection, no fallback, no rate limiting.
 
-### Target implementation
+### Implemented (see `phases/PHASE-02-AI-CHAT.md` § 14 for the per-requirement record)
 
-- Conversation persistence with user and message records
-- Conversation history retrieval and context construction
-- Token budgeting and context-window management
-- An LLM service abstraction that decouples the application from any specific provider
-- Provider configuration (endpoint, key, model) held in settings, not in code
-- `/help` and explicit handling of unknown commands
-- Error feedback to the user on failure
-- Rate limiting and cost control
-- Model configuration with a retry and fallback strategy
-- Reliable AI responses including long-message handling
+- Conversation persistence: `users`, `conversations`, `messages` with Alembic migrations, foreign keys, uniqueness constraints, and indexes on the actual retrieval paths.
+- Conversation history retrieval and context construction, with a bounded, configurable, deterministic truncation strategy (AD-022).
+- An LLM service abstraction: the application depends on `app/domain/ports.LLMProvider`, and `app/infrastructure/llm.create_llm_client` is the single place a provider is selected (FR-16).
+- Provider configuration (endpoint, key, model, provider name, fallback chain) held in settings, not in code.
+- `/help`, `/new`, `/conversations`, `/reset` (with confirmation), and explicit unknown-command handling.
+- Distinct, non-revealing user-facing error feedback for every failure path.
+- Rate limiting extended with a daily allowance inside the existing limiter (AD-025).
+- A bounded, tested model fallback chain (AD-024), and token usage recorded per assistant message (FR-30).
+- Idempotent turn processing keyed on a derived `turn_id` (AD-017).
+
+### Not implemented in this phase
+
+Streaming, conversation summarization, a web dashboard, and any research capability. The
+`analyze_query` decomposition path is retained unused for Phase 3 (AD-026).
 
 ---
 
@@ -363,7 +376,7 @@ Initially populated only with decisions explicitly supported by the repository o
 |---|---|---|---|---|
 | AD-001 | Two-process runtime: a FastAPI + aiogram process and a separate Celery worker process, joined by a Redis broker | This is the structure that exists in the repository (`app/main.py`, `app/core/celery_app.py`, `app/tasks/research_task.py`) | 1 | Accepted (existing) |
 | AD-002 | Telegram long polling instead of a webhook | This is what is implemented (`app/main.py:22`, `dp.start_polling(bot)`). No webhook endpoint exists | 1 | Accepted (existing) |
-| AD-003 | An OpenAI-compatible SDK against a DeepSeek-compatible endpoint as the current LLM integration | This is what is implemented (`app/agents/supervisor.py:7-10`). Recorded as current state, **not** as a long-term recommendation | 1 | Accepted (existing) |
+| AD-003 | An OpenAI-compatible SDK against a DeepSeek-compatible endpoint as the current LLM integration | This is what is implemented (`app/agents/supervisor.py:7-10`). Recorded as current state, **not** as a long-term recommendation | 1 | **Superseded by AD-028** |
 | AD-004 | Redis is the Celery broker **and** result backend | This is the current configuration (`app/core/celery_app.py:6-7`). Flagged by audit M-9 as misconfigured — results are never read and keys accumulate unbounded. Listed here as a record of current state, with remediation required in Phase 1 | 1 | Needs Revision (Phase 1) |
 | AD-005 | PostgreSQL is the intended persistence technology | Declared via `docker-compose.yml:10-20`, `DATABASE_URL` in `app/core/config.py:6`, and `asyncpg`/`sqlalchemy` in `requirements.txt:6-7`. The audit confirms the technology choice but confirms **zero** implementation | 2 | Accepted (intent) / Not Implemented |
 | AD-006 | Web search will be integrated behind a provider abstraction; the concrete provider is undecided | No search provider exists in the repository. Selecting one prematurely would lock in cost and availability assumptions without requirements | 3 | Open |
@@ -375,6 +388,20 @@ Initially populated only with decisions explicitly supported by the repository o
 | AD-012 | Rate limiting is in-process (sliding window plus a global in-flight cap), not Redis-backed | Phase 1 runs a single API process, so an in-memory counter avoids a Redis round-trip on the hot path. Recorded as a limitation: the counters stop being global if the API tier scales horizontally | 1 | Accepted (implemented) — revisit before horizontal scaling |
 | AD-013 | Test dependencies are split into `requirements-dev.txt` | Keeps runtime installs minimal while making the harness explicit. Pinned versions must match `requirements.txt` transitively | 1 | Accepted (implemented) |
 | AD-014 | Non-retryable provider failures are classified by HTTP status: only 408, 409, and 429 are retried | Found during implementation (F-5): a provider 402 "Insufficient Balance" was retried three times per task, contradicting FR-4.4 | 1 | Accepted (implemented) |
+| AD-015 | `conversations` carries a nullable, unconstrained `project_id` reserved for the Phase 5 project association, and messages reference conversations only | Phase 2 § 6 calls a chat-only schema the single most likely source of future rework. Keying messages to a conversation rather than to a user-and-conversation pair means the Phase 5 association is one additive column. The column is deliberately **not** a foreign key: the `projects` table does not exist, and a dangling reference would be implementing Phase 5 | 2 | Accepted (implemented) |
+| AD-016 | The active conversation is derived by query ("the user's most recently updated active conversation"), not stored as a pointer on the user row | A stored pointer would have to be rewritten the moment Phase 5 groups conversations into projects, and would need its own consistency rules. A derived value is always correct and costs one indexed query | 2 | Accepted (implemented) |
+| AD-017 | Idempotency is keyed on a `turn_id` **derived** from the platform identifiers (`sha256(chat_id:message_id)`), with `UNIQUE (turn_id, role)` and `UNIQUE (telegram_chat_id, telegram_message_id)` as the authority | Telegram redelivers updates and Celery redelivers tasks. A derived key means a retry recomputes the same value and collides in the database, so no coordination is needed between workers. A random key would make the constraint useless | 2 | Accepted (implemented) |
+| AD-018 | A chat turn uses **two** transactions: the user message commits first, the assistant reply second | Phase 2 § 15 requires that a user message must not disappear silently. One transaction would roll the user's text back when the provider fails. The cost is that a half-turn is a legitimate intermediate state, which the retry path is written to expect | 2 | Accepted (implemented) |
+| AD-019 | A uniqueness violation aborts the enclosing unit of work rather than being absorbed by a SAVEPOINT | Measured, not assumed: with SQLAlchemy 2.0.36 + asyncpg, rolling a savepoint back while its parent transaction has issued no SQL still leaves the `Session` in a pending-rollback state, and the caller's commit then fails. Letting the violation propagate keeps the contract simple and the caller in control | 2 | Accepted (implemented) |
+| AD-020 | Alembic over the already-declared SQLAlchemy, driven by `DATABASE_URL` with an `ALEMBIC_DATABASE_URL` override | Phase 2 § 6 requires a migration tool and names the existing declaration as the natural target. Alembic adds no second ORM or DDL framework. The URL lives in settings so there is one place to change it and no place one can be committed | 2 | Accepted (implemented) |
+| AD-021 | Test database isolation is enforced by name: the suite refuses any database whose name does not end in `_test`, and migrations additionally require `ALEMBIC_REQUIRE_TEST_DB=1` | Phase 2 § 23. The check is an explicit switch rather than an inference from the URL, because inferring it would mean a *misspelled* test database silently migrates a real one | 2 | Accepted (implemented) |
+| AD-022 | Conversation context is a recent-window truncation: newest `LLM_CONTEXT_MAX_MESSAGES`, then drop oldest until the estimated total fits `LLM_CONTEXT_MAX_TOKENS`. No summarization, no embeddings | Phase 2 § 11 requires a bounded, deterministic strategy. Summarization would add a second model call per turn and a cache to invalidate; embeddings and a vector store are Phase 4 (AD-007). Both limits are configuration (FR-9) | 2 | Accepted (implemented) |
+| AD-023 | The system prompt is a versioned constant with a checksum, and the builder that returns it takes no user content | Phase 2 § 6 requires prompt templates to be versioned or checksummed so a change is detectable. Having no parameter through which user content could reach the prompt makes SR-3 structural rather than a review rule | 2 | Accepted (implemented) |
+| AD-024 | The model fallback chain is bounded twice: by the number of configured models and by `LLM_FALLBACK_MAX_ATTEMPTS`; only retryable failures advance it | Phase 2 FR-32 and FR-33. Advancing on a non-retryable failure cannot succeed and multiplies cost, which is FR-34 | 2 | Accepted (implemented) |
+| AD-025 | The daily request allowance lives in the existing in-process `RateLimiter` rather than in a second limiter | Phase 2 FR-28 needs a daily allowance; two limiters would mean two sets of counters for one decision. It inherits AD-012's in-process limitation, which is recorded rather than hidden | 2 | Accepted (implemented) — revisit with AD-012 |
+| AD-026 | `app/services/research.py` was removed and `app/services/chat.py` took its place, keeping the delivery-neutral contract (`execute` / `notify_failure` / `run`) and the typed error-to-message mapping in `app/services/failures.py` | `DEVELOPMENT_RULES.md` § 4 requires dead code to be wired in or removed. Leaving both would have meant two services racing to own the request path. `app/agents/supervisor.py` and `analyze_query` are **kept** because Phase 3 needs the decomposition capability | 2 | Accepted (implemented) |
+| AD-028 | The OpenAI-compatible endpoint is Groq (`https://api.groq.com/openai/v1`) with model `qwen/qwen3.8-27b`; `LLM_PROVIDER=openai_compatible` remains the selector, so no provider is locked in | The endpoint is configuration, and the endpoint changed. `llama-3.3-70b-versatile` was retired by the provider, which surfaced as a uniform `403` from an egress proxy and was initially misdiagnosed as a credential failure; from a container the key authenticates (200 on `/models`) and the real error is `404 model_not_found`. `qwen/qwen3.8-27b` was chosen after measuring the available models: the `openai/gpt-oss-*` candidates return HTTP 200 with **empty content** and `finish_reason=length` because they spend the output budget on reasoning tokens. The class is unchanged, so swapping endpoints or vendors is still a settings change | 2 | Accepted (implemented) — supersedes AD-003 |
+| AD-027 | The Celery task keeps its Phase 1 name `app.tasks.research_task.process_research` although it now runs the chat flow | `DEVELOPMENT_RULES.md` § 7 forbids renaming an existing application file without an explicit instruction, and a Phase 1 structural test asserts on the literal import. The name is inherited technical debt and is recorded as such | 2 | Accepted (implemented) — rename when authorised |
 
 ### How to use this log
 

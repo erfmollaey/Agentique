@@ -55,3 +55,43 @@ class BrokerUnavailableError(ResearchError):
 
 class DeliveryError(ResearchError):
     """The reply could not be delivered to Telegram."""
+
+
+class PersistenceError(ResearchError):
+    """The database could not be read or written.
+
+    Terminal by default: a schema or connectivity fault will not fix itself on a
+    retry within the same task (FR-23).
+    """
+
+    retryable = False
+
+
+class DuplicateMessageError(PersistenceError):
+    """A message for this turn, or this Telegram message, already exists.
+
+    Not a failure. It is how update redelivery and Celery redelivery are
+    detected: the database constraint is the authority, and the caller decides
+    whether to skip the turn (Phase 2 § 15, § 16).
+    """
+
+    retryable = False
+
+
+class MessageTooLongError(ResearchError):
+    """The inbound message exceeds the configured per-message limit."""
+
+    retryable = False
+
+
+class ConversationNotFoundError(ResearchError):
+    """No conversation with that id belongs to that user (SR-4)."""
+
+    retryable = False
+
+
+class DailyQuotaExceededError(ResearchError):
+    """The user exhausted their daily request allowance (FR-28)."""
+
+    retryable = False
+

@@ -230,8 +230,13 @@ def test_sr1_repository_contains_no_secret_outside_env():
     access (see the autouse guard in ``tests/conftest.py``). ``docs/`` is
     excluded because the audit records findings by file path only.
     """
+    # ``gsk_`` with an underscore: a hyphen variant matches no real Groq key and
+    # silently disabled this scan. Pinned by
+    # test_the_secret_scanner_matches_realistic_key_shapes.
     pattern = re.compile(
-        r"sk-[A-Za-z0-9_-]{16,}|\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"
+        r"sk-[A-Za-z0-9_-]{16,}"
+        r"|gsk_[A-Za-z0-9_-]{16,}"
+        r"|\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"
     )
     offenders: list[str] = []
     for path in ROOT.rglob("*"):
@@ -259,3 +264,50 @@ def test_sr1_network_access_is_blocked_during_tests():
     conftest = (ROOT / "tests" / "conftest.py").read_text()
     assert "block_outbound_network" in conftest
     assert "autouse=True" in conftest
+
+
+# --- Dead code: Phase 2 removed the superseded service (AD-026) ------------
+
+def test_the_superseded_research_service_is_gone():
+    """`DEVELOPMENT_RULES.md` § 4: dead code must be wired in or removed.
+
+    ``app/services/research.py`` was the request-path service in Phase 1. Phase 2
+    replaced it with ``app/services/chat.py``; leaving both would have meant two
+    services racing to own the same request path.
+    """
+    assert not (APP / "services" / "research.py").exists(), (
+        "app/services/research.py was superseded by app/services/chat.py (AD-026) "
+        "and must not come back"
+    )
+    source = (APP / "services" / "chat.py").read_text()
+    assert "ResearchService" not in source
+
+
+def test_the_retained_phase3_seams_are_documented_as_unwired():
+    """The two functions kept for Phase 3 must say so where they are defined.
+
+    A silent unwired function is the rot `DEVELOPMENT_RULES.md` § 4 warns about.
+    Asserting the documentation exists is a cheap guard; attempting a general
+    dead-code detector with AST heuristics produced false positives on decorated
+    handlers, protocol methods, and file-local helpers, so it is not used.
+    """
+    supervisor = (APP / "agents" / "supervisor.py").read_text()
+    assert "no callers" in supervisor or "unwired" in supervisor.lower()
+    assert "Phase 3" in supervisor
+
+    llm = (APP / "infrastructure" / "llm.py").read_text()
+    assert "Unwired: not called by the Phase 2 request path" in llm, (
+        "the LLM seam kept for Phase 3 is undocumented"
+    )
+
+    formatting = (APP / "services" / "formatting.py").read_text()
+    assert "Not called by the Phase 2 request path" in formatting
+    assert "Phase 3" in formatting
+
+
+def test_the_request_path_does_not_use_the_phase3_decomposition_seam():
+    """Chat goes through `complete`; `analyze_query` is for Phase 3."""
+    for module in ("services/chat.py", "tasks/research_task.py", "bot/handlers.py"):
+        source = (APP / module).read_text()
+        assert "analyze_query" not in source, f"{module} uses the Phase 3 seam"
+        assert "generate_final_answer" not in source

@@ -22,13 +22,13 @@ from app.domain.errors import (
     LLMResponseError,
     LLMServiceError,
     LLMTimeoutError,
+    PersistenceError,
     RateLimitedError,
     ResearchError,
 )
 from app.infrastructure.llm import OpenAICompatibleClient
 from app.services.delivery import DeliveryService
-from app.services.research import ResearchService
-from tests.conftest import FakeLLMClient
+from app.services.failures import user_message_for
 
 # --- Classification --------------------------------------------------------
 
@@ -108,65 +108,92 @@ def test_status_error_message_does_not_leak_the_response_body(settings):
 # --- Terminal notice -------------------------------------------------------
 
 def test_non_retryable_failure_sends_exactly_one_notice(fake_bot, settings):
-    service = ResearchService(
-        llm=FakeLLMClient(error=LLMResponseError("bad payload")),
-        delivery=DeliveryService(fake_bot, settings),
-        settings=settings,
-    )
-    service.run(chat_id=42, query="q")
+    """A non-retryable failure terminates the wait with one specific message."""
+    delivery = DeliveryService(fake_bot, settings)
+    delivery.send(42, user_message_for(LLMResponseError("bad payload")))
 
     assert len(fake_bot.sent) == 1
     assert "invalid" in fake_bot.sent[0][1]
 
 
-def test_retryable_failure_still_sends_one_notice_via_run(fake_bot, settings):
-    """``run`` has no retry policy, so it always terminates the user wait."""
-    service = ResearchService(
-        llm=FakeLLMClient(error=LLMTimeoutError("slow")),
-        delivery=DeliveryService(fake_bot, settings),
-        settings=settings,
-    )
-    service.run(chat_id=42, query="q")
+def test_retryable_failure_still_sends_one_notice(fake_bot, settings):
+    """A retryable failure also terminates the wait once retries are exhausted."""
+    delivery = DeliveryService(fake_bot, settings)
+    delivery.send(42, user_message_for(LLMTimeoutError("slow")))
 
     assert len(fake_bot.sent) == 1
     assert "No response in time" in fake_bot.sent[0][1]
 
 
-def test_execute_raises_so_the_task_can_apply_its_retry_policy(fake_bot, settings):
-    """``execute`` must not swallow the error; the task decides."""
-    service = ResearchService(
-        llm=FakeLLMClient(error=LLMTimeoutError("slow")),
-        delivery=DeliveryService(fake_bot, settings),
+def test_the_service_raises_so_the_task_can_apply_its_retry_policy(chat_service, settings):
+    """The chat service must not swallow a provider failure; the task decides."""
+    from app.domain.errors import LLMTimeoutError as Timeout
+    from app.services.chat import ChatService
+    from app.services.context import ContextBuilder
+    from tests.conftest import FakeLLMClient as Fake
+    from tests.fakes import in_memory_uow_factory, user_turn
+
+    factory, _store = in_memory_uow_factory()
+    service = ChatService(
         settings=settings,
+        llm=Fake(error=Timeout("slow")),
+        uow_factory=factory,
+        context=ContextBuilder(settings),
     )
-    with pytest.raises(LLMTimeoutError):
-        service.execute(chat_id=42, query="q")
 
-    assert fake_bot.sent == [], "execute must not message the user on a retryable failure"
+    with pytest.raises(Timeout):
+        _run(service.handle_message(user_turn(1, 42, "q", 1)))
 
 
-def test_notify_failure_uses_a_non_revealing_message(fake_bot, settings):
-    service = ResearchService(
-        llm=FakeLLMClient(), delivery=DeliveryService(fake_bot, settings), settings=settings
-    )
-    service.notify_failure(42, ResearchError("internal detail: db password hunter2"))
+def test_user_message_for_is_non_revealing(settings):
+    """FR-22, SR-9: the message must not carry internal detail."""
+    text = user_message_for(ResearchError("internal detail: db password hunter2"))
 
-    text = fake_bot.sent[0][1]
     assert "hunter2" not in text
     assert "internal detail" not in text
     assert text
 
 
-def test_notify_failure_survives_a_broken_transport(settings):
-    """A failure while reporting a failure must not raise."""
+def test_user_message_for_distinguishes_failure_kinds():
+    """FR-22, FR-23: different failures must not collapse into one message."""
+    messages = {
+        user_message_for(LLMTimeoutError("t")),
+        user_message_for(LLMServiceError("s")),
+        user_message_for(LLMAuthenticationError("a")),
+        user_message_for(PersistenceError("p")),
+    }
+    assert len(messages) >= 3, "failures are indistinguishable to the user"
 
-    class BrokenBot:
-        session = None
 
-        async def send_message(self, chat_id, text):
-            raise RuntimeError("telegram down")
+def test_user_message_for_never_leaks_the_exception_text():
+    for exc in (
+        LLMTimeoutError("timeout talking to https://internal-host/secret"),
+        LLMServiceError("502 from db-password=hunter2"),
+        ResearchError("Traceback (most recent call last): ..."),
+    ):
+        text = user_message_for(exc)
+        assert "hunter2" not in text
+        assert "Traceback" not in text
+        assert "internal-host" not in text
 
-    service = ResearchService(
-        llm=FakeLLMClient(), delivery=DeliveryService(BrokenBot(), settings), settings=settings
-    )
-    assert service.notify_failure(42, ResearchError("x")) == 0
+
+def test_delivery_failure_is_translated_into_a_typed_error(settings):
+    """A transport failure surfaces as ``DeliveryError``, not a raw SDK error."""
+    from app.domain.errors import DeliveryError
+
+    delivery = DeliveryService(_BrokenBot(), settings)
+    with pytest.raises(DeliveryError):
+        delivery.send(42, "anything")
+
+
+class _BrokenBot:
+    session = None
+
+    async def send_message(self, chat_id, text):
+        raise RuntimeError("telegram down")
+
+
+def _run(coro):
+    from app.infrastructure.asyncio_runtime import run_coroutine
+
+    return run_coroutine(coro)

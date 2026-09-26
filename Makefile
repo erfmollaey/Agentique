@@ -1,8 +1,9 @@
-# Phase 1 developer commands.
+# Phase 1 + Phase 2 developer commands.
 #
 #   make install   set up the environment
-#   make test      run the test suite
+#   make test      run the test suite (needs PostgreSQL; see migrate-test-db)
 #   make lint      static checks
+#   make migrate   apply database migrations
 #   make run-api   start the API/poller
 #   make run-worker start the Celery worker
 #   make up        start the full Docker stack
@@ -11,7 +12,8 @@
 PYTHON ?= venv/bin/python
 PIP    ?= venv/bin/pip
 
-.PHONY: install install-dev test lint format typecheck verify \
+.PHONY: install install-dev test test-verbose test-regression lint format typecheck \
+        verify migrate migrate-downgrade revision check-migrations \
         run-api run-worker up down logs clean
 
 install:
@@ -41,7 +43,31 @@ format:
 typecheck:
 	$(PYTHON) -m mypy app
 
-verify: lint test
+verify: lint typecheck test
+
+# --- Database (Phase 2) ---------------------------------------------------
+#
+# The URL comes from DATABASE_URL in .env. Override with ALEMBIC_DATABASE_URL,
+# which takes precedence and is the supported way to target another database
+# without editing a tracked file.
+
+migrate:
+	$(PYTHON) -m alembic upgrade head
+
+migrate-downgrade:
+	$(PYTHON) -m alembic downgrade base
+
+# Autogenerate a new revision. Review the generated file: it is a starting
+# point, not a finished migration.
+revision:
+	$(PYTHON) -m alembic revision --autogenerate -m "$(m)"
+
+# Fail if the models and the migrations have drifted apart. Run this in CI so a
+# model edit that was never migrated cannot reach a deployment.
+check-migrations:
+	$(PYTHON) -m alembic check
+
+# --- Runtime --------------------------------------------------------------
 
 run-api:
 	$(PYTHON) -m uvicorn app.main:app --reload --port 8000

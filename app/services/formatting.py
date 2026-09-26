@@ -76,10 +76,17 @@ def render_analysis(
     questions_label: str = "Sub-questions",
     empty_message: str = "No response received.",
 ) -> str:
-    """Render a query analysis as one safe HTML message.
+    """Render a *query analysis* as one safe HTML message.
 
     Every dynamic value is escaped, so markup characters in model output can
     never break message parsing (FR-3.6, T-4).
+
+    **Not called by the Phase 2 request path.** The chat flow returns the model's
+    own text and does not reshape it. This renderer belongs to the
+    query-decomposition path, which Phase 3 wires up; it is retained, with its
+    Phase 1 test, for the same reason
+    :meth:`app.agents.supervisor.Supervisor.generate_final_answer` is. It is
+    markup-safety-tested, so it cannot silently rot.
     """
     safe_summary = escape(summary)
     questions = [escape(q) for q in sub_questions if q and str(q).strip()]

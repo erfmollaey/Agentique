@@ -1,6 +1,7 @@
-# Phase 1 local development stack.
+# Phase 1 + Phase 2 local development stack.
 #
-# The two application services (api, worker) plus the infrastructure they need.
+# The two application services (api, worker) plus the infrastructure they need:
+# Redis for the broker and PostgreSQL for chat persistence (Phase 2).
 # This is a local development topology, not production: no TLS termination,
 # no secrets manager, no orchestration (Phase 8 territory).
 #
@@ -16,11 +17,16 @@ x-app: &app
   env_file:
     - .env
   environment:
-    # Inside the compose network the broker is the service name, not localhost.
+    # Inside the compose network the broker and the database are service names,
+    # not localhost.
     REDIS_URL: redis://redis:6379/0
+    DATABASE_URL: >-
+      postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-research_db}
   restart: unless-stopped
   depends_on:
     redis:
+      condition: service_healthy
+    postgres:
       condition: service_healthy
 
 services:
@@ -40,8 +46,11 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    # No default credentials. POSTGRES_PASSWORD must be supplied via .env.
-    # Declared for Phase 2; no application code connects to it in Phase 1.
+    # No default credentials. POSTGRES_USER and POSTGRES_PASSWORD must be
+    # supplied via .env.
+    # Phase 2: the chat flow reads and writes here. Apply the schema with
+    #   docker compose run --rm api alembic upgrade head
+    # or `make migrate` from the host.
     env_file:
       - .env
     environment:

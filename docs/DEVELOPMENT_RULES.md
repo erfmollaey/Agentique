@@ -6,6 +6,14 @@
 
 > These rules are not advisory. A change that violates them is incomplete, regardless of whether the code works.
 
+> **Note on the "Current state" blocks below (added 2026-09-26).** They were
+> written against the pre-Phase-1 audit and several are now out of date: there *is*
+> a service layer, there *is* a database, and the suite is no longer empty. They
+> are left in place as the baseline the rules were written for. For current state
+> see [`PROJECT_PLAN.md`](./PROJECT_PLAN.md) and
+> [`phases/PHASE-02-AI-CHAT.md`](./phases/PHASE-02-AI-CHAT.md) § 14. The rules
+> themselves are unchanged.
+
 ---
 
 ## 1. Phase Discipline

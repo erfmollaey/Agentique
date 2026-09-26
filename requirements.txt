@@ -33,14 +33,21 @@ pydantic-settings==2.7.0
 # could not start the application (audit C-2).
 openai==2.44.0
 
-# --- Reserved for Phase 2 (data layer) ---
-# No application module imports these yet; there is no database code in
-# Phase 1 (audit M-2). Both are reserved, not removed, so Phase 2 does not
-# have to re-introduce the data layer from scratch.
-# asyncpg: reserved for Phase 2, the async PostgreSQL driver.
+# --- Data layer (Phase 2) ---
+# The audit confirmed zero database code; Phase 2 introduces it. Both were
+# declared-but-unused during Phase 1 and are now imported by app/db.
+# asyncpg: the async PostgreSQL driver used by SQLAlchemy's async engine.
 asyncpg==0.30.0
-# sqlalchemy: reserved for Phase 2, the ORM and migration target.
+# sqlalchemy: the ORM and the migration target.
 sqlalchemy==2.0.36
+# alembic: schema migrations. Phase 2 requires a migration tool, and Phase 2 §6
+# names the existing SQLAlchemy declaration as the natural target, so Alembic is
+# the smallest solution that adds no second ORM or DDL framework.
+alembic==1.14.0
+# greenlet: a hard requirement of SQLAlchemy's asyncio support. Declared
+# explicitly rather than left as an implicit transitive pin, because the
+# application depends on it directly for every async database call.
+greenlet==3.1.1
 
 
 # --- Test dependencies ---

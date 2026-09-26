@@ -23,6 +23,55 @@
 > Seven additional defects were found *during* Phase 1 implementation and are
 > recorded in the Phase 1 document § 14, not here, because they did not exist
 > when this audit was taken.
+>
+> ### Update — 2026-09-26, after Phase 2 (AI Chat MVP)
+>
+> Phase 2 has since been implemented. The audit findings below are **still not
+> edited**; they remain the pre-Phase-1 baseline. The structural conclusions that
+> Phase 2 changed are noted here so a reader is not misled by § 7's "no service
+> layer" or § 6's "no database code" when looking at the current code:
+>
+> - **A service layer now exists** (`app/services/`), with a chat service owning
+>   conversation orchestration and a context service owning ordering, budgeting,
+>   and truncation. `app/services/research.py` was removed and its delivery-neutral
+>   contract moved to `app/services/chat.py` (`AD-026`).
+> - **A data layer now exists** (`app/db/`, `app/repositories/`): `users`,
+>   `conversations`, `messages`, with Alembic migrations. Audit finding M-2
+>   ("no database layer") and M-3 ("no conversation memory") are resolved.
+> - **`DATABASE_URL` is now required** and wired into a real async engine. The
+>   `/ready` endpoint, which this audit's H-5 finding correctly said did not
+>   probe PostgreSQL, now does.
+> - **The request path is no longer a query decomposition.** It is a persistent
+>   multi-turn chat. `Supervisor.analyze_query` (M-1's dead-code finding) is
+>   retained but unwired, for Phase 3.
+> - **The single hardcoded provider is now selected by configuration**, behind a
+>   factory, with a bounded fallback chain. The endpoint is Groq rather than the
+>   DeepSeek-compatible one named in this audit's § 5.
+> - **The `bot ↔ tasks` circular dependency** this audit recorded as structural
+>   was already broken in Phase 1 and remains broken.
+>
+> Six further defects were found during Phase 2 and are recorded in
+> [`phases/PHASE-02-AI-CHAT.md`](./phases/PHASE-02-AI-CHAT.md) § 14.
+>
+> ### Update — 2026-09-26, Phase 2 completion pass
+>
+> Two changes since the note above, both recorded rather than folded into the
+> audit text:
+>
+> - **Account deletion exists (SR-9).** `/delete_account confirm` removes the
+>   user row; the foreign keys cascade to conversations and messages. One
+>   statement, one transaction. The cascade was verified against real PostgreSQL
+>   rather than inferred from the schema, and proven narrow by deleting one of
+>   two users and checking the survivor. This is the only capability the audit's
+>   "no user accounts" line could be read as contradicting, so it is called out.
+> - **The LLM endpoint is Groq, not the DeepSeek-compatible one** named in § 5 of
+>   this audit, and the model is `qwen/qwen3.8-27b`. The client class is
+>   unchanged, so the "one hardcoded provider" finding is still resolved — the
+>   difference is configuration, recorded as `AD-028`.
+>
+> Two defects found in this pass are recorded in the Phase 2 document, not here:
+> every secret scanner in the repository was blind to Groq's `gsk_` key format
+> (`P2-7`), and the configured model had been retired by the provider (`P2-8`).
 
 **Audit type:** READ-ONLY technical audit
 **Repository:** `/Users/erfmollaey/projects/telegram-research-bot`

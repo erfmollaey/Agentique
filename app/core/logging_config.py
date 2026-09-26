@@ -12,6 +12,10 @@ from typing import Any
 
 _CONFIGURED = False
 
+# The handler this module installed, so it can be identified rather than guessed
+# at. See configure_logging for why identity matters.
+_OWN_HANDLER: logging.Handler | None = None
+
 # Never let a secret reach a log record, even via an accidental f-string.
 _SECRET_MARKERS = ("api_key", "apikey", "token", "password", "secret")
 
@@ -37,8 +41,22 @@ def configure_logging(level: str = "INFO") -> None:
 
     Idempotent (FR-9.1): repeated calls are a no-op, so importing this module
     from several entry points cannot duplicate log lines.
+
+    It adds its own handler and **does not clear the root logger's existing
+    handlers**. It used to call ``root.handlers.clear()``, which quietly
+    destroyed any handler another component had already attached — a test
+    framework's capture handler, or an embedder's. That made logging
+    configuration order-dependent and invisible: records still reached the
+    console, so nothing looked broken, while every other listener stopped
+    receiving them. Found during Phase 2 completion because a Phase 2 security
+    assertion (SR-5, no message content in the log) passed or failed depending
+    on which test module happened to be imported first.
+
+    Removing only *our own* handler would also be correct, but the
+    ``_CONFIGURED`` guard already makes a second installation impossible, so
+    there is nothing to remove.
     """
-    global _CONFIGURED
+    global _CONFIGURED, _OWN_HANDLER
     if _CONFIGURED:
         return
 
@@ -52,9 +70,10 @@ def configure_logging(level: str = "INFO") -> None:
     handler.addFilter(_RedactingFilter())
 
     root = logging.getLogger()
-    root.handlers.clear()
+    # Deliberately not `root.handlers.clear()` — see the docstring.
     root.addHandler(handler)
     root.setLevel(level.upper())
+    _OWN_HANDLER = handler
 
     # Third-party loggers are noisy at INFO and can echo request URLs.
     for noisy in ("httpx", "httpcore", "aiosqlite", "aiogram.event", "openai"):

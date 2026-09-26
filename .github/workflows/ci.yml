@@ -1,0 +1,115 @@
+name: CI
+
+# Phase 2 validation. The canonical commands are the ones the Makefile exposes,
+# so CI and a developer run exactly the same checks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Phase 2 needs a real PostgreSQL: the migration and constraint tests are
+    # specified against a real database, and SQLite would not exercise unique
+    # violation handling, foreign key cascades, or the ordering index.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: research_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # No credential is read from .env in CI: the values below are throwaway
+      # service credentials, and the bot token / provider key are placeholders.
+      # The real secrets are never present in the repository.
+      # Deliberately not token-shaped: the repository secret scan flags any
+      # value matching a real Telegram token or provider key, and a CI
+      # placeholder that looks like a credential is one.
+      BOT_TOKEN: "ci-placeholder-not-a-real-token"
+      GROQ_API_KEY: "placeholder-not-a-real-credential"
+      REDIS_URL: redis://localhost:6379/15
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/research_db
+      # The suite refuses any database whose name does not end in "_test".
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/research_db_test
+      LOG_LEVEL: WARNING
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: make lint
+
+      - name: Type check
+        run: make typecheck
+
+      - name: Create the test database
+        # The service container creates only `research_db`; the suite's database
+        # must be created explicitly so the isolation guard has something real
+        # to protect.
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE research_db_test" || true
+
+      - name: Migrations apply to an empty database
+        run: |
+          export ALEMBIC_DATABASE_URL="$TEST_DATABASE_URL"
+          export ALEMBIC_REQUIRE_TEST_DB=1
+          alembic upgrade head
+          alembic current
+
+      - name: Migrations match the models
+        run: |
+          export ALEMBIC_DATABASE_URL="$TEST_DATABASE_URL"
+          export ALEMBIC_REQUIRE_TEST_DB=1
+          alembic check
+
+      - name: Test suite
+        run: make test
+
+      - name: Secret scan
+        # Phase 1 SR-10, previously implemented only as a test. It runs here too
+        # so a leak fails the build even if the test suite is skipped.
+        run: |
+          # gsk_ takes an UNDERSCORE. A hyphen variant matches no real Groq key.
+          if git grep -nEI '(sk-[A-Za-z0-9_-]{16,}|gsk_[A-Za-z0-9_-]{16,})' -- \
+            ':!.env.example' ':!tests' ':!docs'; then
+            echo "::error::secret-shaped value found outside .env.example"
+            exit 1
+          fi
+          if git grep -nE '\b[0-9]{8,10}:[A-Za-z0-9_-]{30,}\b' -- \
+            ':!.env.example' ':!tests' ':!docs'; then
+            echo "::error::Telegram-bot-token-shaped value found outside .env.example"
+            exit 1
+          fi
+          echo "no secret-shaped values found"

@@ -18,31 +18,26 @@ from tests.conftest import LoopBoundBot
 
 
 @pytest.fixture
-def wired(monkeypatch, settings):
+def wired(monkeypatch, settings, chat_service):
     """Point the task's process container at test doubles.
 
     Mirrors what a worker child process builds, without a broker or a socket.
     """
     from app.bot import container as container_module
-    from app.domain.schemas import QueryAnalysis
     from app.services.delivery import DeliveryService
     from app.services.rate_limit import RateLimiter
-    from app.services.research import ResearchService
-    from tests.conftest import FakeLLMClient
 
     bot = LoopBoundBot()
-    llm = FakeLLMClient(
-        result=QueryAnalysis(summary="summary text", sub_questions=["q1", "q2"])
-    )
     delivery = DeliveryService(bot, settings)
     built = container_module.AppContainer(
         settings=settings,
         bot=bot,  # type: ignore[arg-type]
         dispatcher=None,  # type: ignore[arg-type]
-        llm=llm,
+        llm=None,  # type: ignore[arg-type]
         delivery=delivery,
-        research=ResearchService(llm, delivery, settings),
         rate_limiter=RateLimiter(settings),
+        database=None,
+        chat=chat_service,
     )
     monkeypatch.setattr(container_module, "get_container", lambda: built)
     return built, bot
@@ -102,8 +97,16 @@ def test_real_task_releases_the_rate_limit_slot(wired):
 
 
 def test_worker_lifecycle_signals_are_connected():
-    """The signals that make the loop per-process must actually be wired."""
+    """The signals that make the loop per-process must actually be wired.
+
+    Imports the module explicitly rather than relying on another test having
+    imported it first. The previous version passed only because the tests above
+    it imported ``app.tasks.research_task``, which imports ``lifecycle``; that
+    was an ordering accident, not an assertion.
+    """
     from celery.signals import worker_process_init, worker_process_shutdown
+
+    import app.tasks.lifecycle  # noqa: F401  registers the signal receivers
 
     init_senders = {s for _, s in worker_process_init.receivers}
     shutdown_senders = {s for _, s in worker_process_shutdown.receivers}
@@ -127,7 +130,7 @@ def test_worker_process_init_creates_a_fresh_loop():
     assert child_loop.is_closed(), "shutdown did not close the loop"
 
 
-def test_shutdown_closes_the_telegram_session(monkeypatch, settings):
+def test_shutdown_closes_the_telegram_session(monkeypatch, settings, chat_service):
     """Order matters: the session must close before the loop does."""
     from app.bot import container as container_module
     from app.services.delivery import DeliveryService
@@ -141,8 +144,9 @@ def test_shutdown_closes_the_telegram_session(monkeypatch, settings):
         dispatcher=None,  # type: ignore[arg-type]
         llm=None,  # type: ignore[arg-type]
         delivery=DeliveryService(bot, settings),
-        research=None,  # type: ignore[arg-type]
         rate_limiter=None,  # type: ignore[arg-type]
+        database=None,
+        chat=chat_service,
     )
     monkeypatch.setattr(container_module, "get_container", lambda: built)
 

@@ -1,8 +1,14 @@
 # Phase 2 — AI Chat MVP
 
-**Status:** Not Started
-**Blocked by:** Phase 1 — Core Infrastructure & Stabilization
-**Evidence base:** [`../ARCHITECTURE.md`](../ARCHITECTURE.md)
+**Status:** In Progress — implementation and validation complete; blocked on Phase 1 credential rotation
+**Active Phase:** Yes
+**Blocked by:** Phase 1 — Core Infrastructure & Stabilization (In Progress)
+**Evidence base:** [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — historical audit snapshot, preserved unmodified
+**Implementation record:** § 14. This document's § 2 describes the repository *before* this phase; its findings are retained as the baseline, not as a statement of current state.
+
+> Every requirement below traces to this document. Statuses in § 14 reflect what was
+> implemented and validated, not what was intended. Historical audit findings are not
+> rewritten.
 
 ---
 
@@ -343,10 +349,459 @@ Phase 2 is complete when:
 
 ## 14. Status
 
-**Current status: Not Started**
+**Current status: Complete, with environmental verification limitations.**
 
-**Phase status in `docs/PROJECT_PLAN.md`: Not Started.**
+Every Phase 2 requirement is implemented and verified, every acceptance criterion
+in § 10 is met, and every item in § 13 is satisfied. The remaining items are
+external and are listed explicitly below rather than folded into the status.
 
-**Blocked by:** Phase 1 — Core Infrastructure & Stabilization.
+**Phase status in `docs/PROJECT_PLAN.md`: Complete.**
 
-No Phase 2 work has been implemented. The repository has no database code, no conversation model, and no service layer. The only current behavior is a single stateless LLM call per message, as described in § 2.
+### Why this status and not "Complete"
+
+The distinction is drawn against § 13, the phase's own Definition of Done:
+
+| § 13 item | Status |
+|---|---|
+| 1. Every acceptance criterion in § 10 checked and evidenced | Met — see the acceptance table below |
+| 2. Users, conversations, messages persist, migrate cleanly, retrievable | Met — real PostgreSQL, real migrations, real end-to-end run |
+| 3. A user can hold a verified multi-turn conversation | Met — verified against the live provider, with history in the request |
+| 4. Application depends on an LLM abstraction, verified by a swapping test | Met — `test_the_service_layer_accepts_any_object_with_complete` |
+| 5. `/help`, unknown-command handling, user-visible error feedback | Met |
+| 6. Rate limiting, concurrency capping, token recording enforced and tested | Met |
+| 7. A bounded, tested fallback chain | Met — both error classes |
+| 8. Cross-user isolation and prompt-injection resistance tested | Met — SR-4 and the Phase 2 scope of SR-3 |
+| 9. Documentation updated, including the data model and provider abstraction | Met |
+| 10. No Phase 3–9 functionality implemented | Met |
+| 11. Status updated in this document and in `PROJECT_PLAN.md` | Met |
+
+**SR-3 remains Partial, and that is the specification's own boundary.** § 4
+assigns the full prompt-injection defence system to Phase 3, because that is
+where external content first enters a prompt. The guarantees Phase 2 owes are
+implemented and tested. It is recorded as Partial rather than quietly upgraded to
+Implemented.
+
+### What is NOT verified, and why
+
+| Item | State | Reason |
+|---|---|---|
+| Telegram message delivery | **NOT VERIFIED** | `api.telegram.org` refuses the connection from both the host and the container. Every send raised `TelegramNetworkError`, correctly contained. The delivery *logic* is tested with substituted transports; the real API was never contacted |
+| GitHub Actions execution | **NOT VERIFIED** | The workflow is configured and every step was validated locally, but the `gh` CLI is not installed and the workflow has never run on GitHub |
+| `docker build` with the committed `Dockerfile` verbatim | **NOT VERIFIED** | Docker Hub returns 403 for every manifest in this environment. A build differing only in the `FROM` line succeeded, so the instructions are sound |
+| Phase 1 credential rotation (P0-3 / SR-4) | **Open — human action** | Requires @BotFather and the provider dashboard. **Now sharper:** the key in `.env` is confirmed **live and working**, so it is a real disclosure risk, not a theoretical one. This is a Phase 1 item and is not part of this phase's Definition of Done |
+
+None of the four is a missing Phase 2 implementation. None can be closed from this
+repository: each needs a network path, a GitHub account, or a human with dashboard
+access.
+
+### What changed
+
+```text
+BEFORE (18 modules)                     AFTER (27 modules)
+─────────────────────                   ─────────────────────
+                                       app/domain/chat.py      198  roles, records, outcome
+                                       app/domain/ports.py     178  repository + LLM ports
+app/core/config.py     140              app/db/base.py           33  naming convention
+                                         app/db/models.py        210  users/conversations/messages
+app/services/                               app/db/session.py       180  engine + session + test guard
+  research.py          143  REMOVED       app/db/unit_of_work.py   74  one transaction per operation
+  formatting.py        110               app/db/migrations/       —   Alembic env + 1 revision
+  delivery.py          104               app/repositories/        —   users, conversations, messages
+  rate_limit.py        116  + daily       app/services/chat.py    420  chat orchestration
+  health.py              90  + db probe    app/services/context.py 186  order, budget, truncation
+                                         app/services/prompts.py  78  versioned system prompt
+                                         app/services/failures.py  84  typed error → user message
+app/infrastructure/
+  llm.py               175  + complete()  app/infrastructure/llm.py 380  chat, usage, fallback, factory
+```
+
+Total: 18 → 27 modules, ~1,700 → ~3,400 statements. 123 → **329 tests**.
+
+### Requirement matrix
+
+Every row is evidenced by a named test. "Implemented" means the behaviour exists
+and is verified; the test id is the evidence.
+
+#### Conversation persistence
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-1 | A user record exists for every Telegram user, keyed on the platform id | Implemented | `test_database_layer.py::test_a_user_record_is_created_on_first_interaction`, `::test_a_second_interaction_reuses_the_same_user` |
+| FR-2 | Every inbound user message is persisted with its chat, sender, timestamp, content | Implemented | `test_chat_service.py::test_both_messages_of_a_turn_are_persisted`, `test_database_layer.py::test_messages_are_returned_in_chronological_order` |
+| FR-3 | Every outbound bot message persisted, **or the decision not to recorded** | Implemented (decision recorded) | Assistant replies are persisted. Command replies, acknowledgements, and failure notices are **not**: they are not conversation content and persisting them would pollute the model's history. Recorded here and in `app/services/chat.py` |
+| FR-4 | A conversation groups messages; multiple conversations per user | Implemented | `test_database_layer.py::test_a_user_may_have_many_conversations`, `test_chat_service.py::test_the_same_user_keeps_one_conversation_across_messages` |
+| FR-5 | Start, continue, list, and reset conversations | Implemented | `test_telegram_chat_flow.py::test_new_starts_a_conversation_and_does_not_enqueue`, `::test_conversations_lists_them`, `::test_reset_confirm_performs_the_reset` |
+| FR-6 | Deleting or resetting does not delete the user | Implemented | `test_database_layer.py::test_reset_deletes_messages_but_keeps_the_conversation_and_user` |
+
+#### Context management
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-7 | Prior messages retrieved in chronological order | Implemented | `test_database_layer.py::test_messages_are_returned_in_chronological_order` (T-3), `test_context_policy.py::test_history_is_not_reordered` |
+| FR-8 | Assembled context fits the configured window | Implemented | `test_context_policy.py::test_context_exceeding_the_message_cap_drops_the_oldest`, `::test_context_is_trimmed_further_when_the_token_budget_binds` (T-4) |
+| FR-9 | A defined strategy applies; it is configuration, not a constant | Implemented | `test_context_policy.py::test_the_message_cap_is_configuration_not_a_constant`; strategy recorded as AD-022 |
+| FR-10 | A per-message token estimate is enforced before the provider call | Implemented | `test_context_policy.py::test_an_oversized_single_message_is_still_sent`, `::test_estimator_counts_per_message_overhead` |
+| FR-11 | The system prompt is separate from user content, never built by concatenation | Implemented | `test_context_policy.py::test_the_system_prompt_takes_no_user_content`, `::test_user_content_never_appears_in_a_system_message` (T-7) |
+
+#### LLM service
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-12 | The application depends on an abstraction, not a provider SDK | Implemented | `test_llm_provider_and_fallback.py::test_the_shipped_provider_satisfies_the_port_protocol` (T-5) |
+| FR-13 | Credentials, endpoint, and model are configuration | Implemented | `tests/test_config_and_security.py::test_sr1_no_secret_literal_in_application_source` |
+| FR-14 | At least one provider behind the abstraction | Implemented | `app/infrastructure/llm.py::OpenAICompatibleClient`, configured for Groq |
+| FR-15 | Provider responses returned as a validated domain type | Implemented | `test_llm_provider_and_fallback.py::test_complete_returns_a_validated_domain_object`, `::test_an_empty_response_is_rejected` |
+| FR-16 | A second provider or a documented extension point | Implemented | `app/infrastructure/llm.py::create_llm_client`; `test_llm_provider_and_fallback.py::test_the_service_layer_accepts_any_object_with_complete` (T-6), `::test_an_unknown_provider_is_rejected_with_a_readable_error` |
+
+#### Commands and UX
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-17 | `/help` lists commands with a description | Implemented | `test_telegram_chat_flow.py::test_help_lists_the_available_commands` (T-8) |
+| FR-18 | Unknown commands get a helpful response | Implemented | `test_telegram_chat_flow.py::test_an_unknown_command_is_answered_not_treated_as_text` (T-8) |
+| FR-19 | Command arguments are validated before use | Implemented | `test_telegram_chat_flow.py::test_reset_requires_explicit_confirmation`; `/reset` ignores any argument other than `confirm` |
+| FR-20 | Destructive commands require explicit confirmation | Implemented | `test_telegram_chat_flow.py::test_reset_requires_explicit_confirmation` |
+
+#### Reliability
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-21 | Exactly one terminal response per message | Implemented | `test_telegram_chat_flow.py::test_a_text_message_is_acknowledged_and_enqueued`; `test_celery_chat_task.py::test_a_turn_produces_exactly_one_reply` (T-11) |
+| FR-22 | A provider failure gives a distinct, non-revealing message | Implemented | `test_telegram_chat_flow.py::test_user_messages_expose_no_infrastructure_detail`, `::test_every_domain_failure_has_its_own_message` (T-9) |
+| FR-23 | A persistence failure gives a distinct, user-readable message | Implemented | `test_telegram_chat_flow.py::test_a_command_failure_produces_a_readable_message` (T-10) |
+| FR-24 | Responses respect Telegram's length limit and are chunked | Implemented (Phase 1, retained) | `tests/test_telegram_output_safety.py`; `app/services/formatting.py::split_for_telegram` |
+| FR-25 | Long responses arrive in multiple messages without duplication or loss | Implemented (Phase 1, retained) | `tests/test_telegram_output_safety.py` |
+
+#### Rate limiting and cost
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-26 | Per-user throttling with a configurable limit and window | Implemented (Phase 1, retained) | `tests/test_telegram_routing.py::test_user_rate_limit_is_enforced_after_allowance` |
+| FR-27 | A global concurrency cap | Implemented (Phase 1, retained) | `tests/test_telegram_routing.py::test_global_capacity_is_enforced_and_explained` (T-13) |
+| FR-28 | A per-user daily request allowance | Implemented | `test_telegram_chat_flow.py::test_the_daily_allowance_is_enforced_and_explained`; AD-025 |
+| FR-29 | A throttled request is told when it may retry | Implemented | `test_telegram_chat_flow.py::test_throttling_states_when_the_user_may_retry` (T-12) |
+| FR-30 | Token usage recorded per request | Implemented | `test_database_layer.py::test_token_usage_is_recorded_per_message`, `test_llm_provider_and_fallback.py::test_token_usage_is_returned_for_cost_tracking` (T-20) |
+
+#### Model strategy
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| FR-31 | The model is configurable | Implemented | `LLM_MODEL` in settings; `test_context_policy.py` uses it per test |
+| FR-32 | A retryable failure advances a fallback chain | Implemented | `test_llm_provider_and_fallback.py::test_a_retryable_failure_falls_back_to_the_next_model` (T-14) |
+| FR-33 | Fallback is bounded | Implemented | `test_llm_provider_and_fallback.py::test_the_chain_never_exceeds_the_configured_attempt_bound` |
+| FR-34 | Non-retryable errors do not trigger fallback | Implemented | `test_llm_provider_and_fallback.py::test_a_non_retryable_failure_does_not_fall_back`, `::test_a_malformed_response_does_not_fall_back` (T-15) |
+
+#### Security
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| SR-1 | No secret in source | Implemented | `test_config_and_security.py::test_sr1_no_secret_literal_in_application_source`; CI secret-scan step |
+| SR-2 | User content is untrusted, never interpolated into a system instruction | Implemented | `test_context_policy.py::test_user_content_never_appears_in_a_system_message`, `::test_stored_content_is_not_promoted_to_a_system_instruction` |
+| SR-3 | Stored user content must not escalate its own privilege across turns | **Partial** | Structurally addressed: `build_system_prompt()` takes no parameters, so stored content has no path to the instructions — `test_context_policy.py::test_the_system_prompt_takes_no_user_content`, `::test_stored_content_is_not_promoted_to_a_system_instruction`, `::test_user_content_never_appears_in_a_system_message`. The full defence system belongs with the research pipeline in Phase 3, where external content first enters a prompt |
+| SR-4 | One user's conversation is never returned to another | Implemented | `test_database_layer.py::test_a_conversation_is_not_returned_to_another_user`, `test_chat_integration.py::test_one_user_cannot_reach_another_users_conversation` (T-16) |
+| SR-5 | Identifiers and metadata are logged, not content | Implemented | `test_chat_service.py::test_no_message_content_is_written_to_the_log` |
+| SR-6 | Persisted content is untrusted on read | Implemented | `test_context_policy.py::test_stored_content_is_not_promoted_to_a_system_instruction` |
+| SR-7 | Rate limits are enforced server-side | Implemented | `app/services/rate_limit.py`, driven only by the server-observed user id |
+| SR-8 | Token accounting is derived server-side | Implemented | `test_llm_provider_and_fallback.py::test_token_usage_is_returned_for_cost_tracking`; nothing accepts a client-supplied count |
+| SR-9 | A user can delete their data, and deletion actually removes it | **Implemented** | `/delete_account confirm`. Service: `tests/test_data_deletion.py::test_deletion_removes_the_user_and_everything_reachable`, `::test_a_deleted_identity_starts_clean_rather_than_resuming`. Cascade verified against real PostgreSQL: `::test_the_cascade_removes_the_whole_tree`, `::test_the_cascade_leaves_another_user_untouched`, `::test_the_remaining_conversation_belongs_to_the_surviving_user`. Transactional: `::test_a_failure_during_deletion_rolls_the_whole_thing_back`. Command surface: `tests/test_delete_account_command.py` (11 tests) |
+| SR-10 | No SQL built by string concatenation | Implemented | `test_telegram_chat_flow.py::test_no_module_builds_sql_by_string_concatenation`, `::test_the_data_layer_is_the_only_place_sqlalchemy_is_imported` |
+
+**One security requirement is deliberately Partial.**
+
+- **SR-3 is Partial, by the specification's own boundary.** Cross-turn
+  prompt-injection resistance is addressed structurally — the system prompt is
+  unreachable from user content because the function that returns it takes no
+  parameters — but this document assigns the full defence system to Phase 3,
+  where external content first enters a prompt. The structural guarantees this
+  phase owes are in place and tested: the system prompt is independent of user
+  content, stored content is not promoted to an instruction, and history is
+  passed as user/assistant messages rather than as privileged instructions. No
+  Phase 3 work was done to close the remainder.
+
+SR-9 is now implemented; see its row above and § 14 for the command, the
+confirmation mechanism, and the transactional evidence.
+
+#### Data layer
+
+| ID | Requirement | Status | Evidence |
+|---|---|---|---|
+| M-1 | Migrations managed by a declared tool | Implemented | `app/db/migrations/`, `alembic==1.14.0` in `requirements.txt`; AD-020 |
+| M-2 | `DATABASE_URL` wired into a real session factory | Implemented | `app/db/session.py::Database`; now a required setting |
+| M-3 | Indexes on every foreign key and retrieval column | Implemented | `test_database_layer.py::test_every_declared_index_exists_in_the_database`, `::test_message_history_retrieval_uses_the_declared_index` |
+| M-4 | Uniqueness on the platform user identifier | Implemented | `test_database_layer.py::test_duplicate_telegram_identity_is_impossible` |
+| M-5 | All schema changes via migrations | Implemented | `test_migrations_and_isolation.py::test_the_models_and_the_migrations_agree` (`alembic check`); no `create_all` anywhere |
+| M-6 | The schema anticipates Phase 5 workspaces | Implemented | `conversations.project_id` reserved; AD-015 |
+
+#### Tests
+
+| ID | Test | Status |
+|---|---|---|
+| T-1 | A user record is created once and reused | Implemented |
+| T-2 | A second message is persisted and linked | Implemented |
+| T-3 | History in correct chronological order | Implemented |
+| T-4 | Context truncated when it exceeds the window | Implemented |
+| T-5 | The service layer works against a fake provider, no network | Implemented |
+| T-6 | Swapping the provider needs no service change | Implemented |
+| T-7 | System instructions never built from user content | Implemented |
+| T-8 | `/help` lists commands; unknown command is answered | Implemented |
+| T-9 | Provider failure yields a readable message, no internal detail | Implemented |
+| T-10 | Persistence failure yields a readable message | Implemented |
+| T-11 | Exactly one terminal response per message | Implemented |
+| T-12 | Throttling rejects past the threshold and explains the retry time | Implemented |
+| T-13 | The concurrency cap holds | Implemented |
+| T-14 | A retryable failure triggers fallback | Implemented |
+| T-15 | A non-retryable failure does not trigger fallback | Implemented |
+| T-16 | One user's conversation is never returned for another | Implemented |
+| T-17 | Long responses are chunked without loss | Implemented (Phase 1) |
+| T-18 | Migrations apply to an empty database and roll back | Implemented — `test_migrations_and_isolation.py::test_migrations_round_trip_on_a_dedicated_scratch_database` |
+| T-19 | Foreign keys and uniqueness constraints are enforced | Implemented |
+| T-20 | Token usage is recorded per request | Implemented |
+
+### Acceptance criteria (§ 10)
+
+| Criterion | Status |
+|---|---|
+| User, conversation, and message records exist and are created automatically | Met |
+| Migrations apply and roll back cleanly on an empty database | Met — validated on a throwaway database, empty → head → base → head |
+| Foreign keys and uniqueness constraints are enforced | Met |
+| Retrieval queries are covered by indexes | Met — asserted against `pg_indexes`, and `EXPLAIN` is checked for an index scan |
+| A user can hold a multi-turn conversation and the model receives prior turns | Met — `test_chat_integration.py::test_a_second_message_continues_the_same_conversation` |
+| Context stays within the configured window under a long conversation | Met — `test_chat_service.py::test_history_is_capped_so_context_cannot_grow_without_bound` |
+| A user can start, list, and reset conversations | Met |
+| Deleting a conversation does not delete the user | Met — `test_database_layer.py::test_reset_deletes_messages_but_keeps_the_conversation_and_user`; `/reset` and `/delete_account` are separate commands, asserted in `test_delete_account_command.py::test_reset_does_not_delete_the_account` |
+| A user can delete their data, and it is really removed (SR-9) | Met — `/delete_account confirm`; 25 tests across `test_data_deletion.py` and `test_delete_account_command.py`, including the cascade and the transactional rollback against real PostgreSQL |
+| The application layer depends on an abstraction, not a provider SDK | Met |
+| Provider credentials, endpoint, and model are configuration | Met |
+| At least one provider behind the abstraction | Met |
+| A second provider or a documented extension point | Met |
+| Provider output is validated before use | Met |
+| `/help` lists available commands | Met |
+| Unknown commands receive a helpful response | Met |
+| Every message produces exactly one terminal response | Met |
+| Long responses are chunked correctly | Met (Phase 1) |
+| Failures produce distinct, user-readable messages | Met |
+| Per-user throttling is enforced and tested | Met |
+| A global concurrency cap is enforced and tested | Met |
+| Token usage is recorded per request | Met |
+| A bounded fallback chain, tested for both error classes | Met |
+| System instructions are never derived from user content | Met — SR-3's Phase 2 scope. The remainder is Partial by design and assigned to Phase 3 |
+| One user's conversation is never accessible by another | Met |
+| No user content appears in logs without a documented need | Met |
+| No SQL is built by string concatenation | Met |
+| Telegram handlers and Celery tasks contain no business logic | Met — enforced structurally; `test_telegram_chat_flow.py`, `test_celery_chat_task.py::test_the_task_contains_no_business_logic` |
+| Tests run without network access | Met — the autouse socket guard fails any non-loopback connection. **Verified:** 368 tests pass with no egress, including 30 against a real database over loopback |
+| Documentation is updated | Met |
+| No Phase 3–9 functionality was implemented | Met — see "Not implemented" below |
+
+### The provider 403: what it actually was, and the correction
+
+An earlier revision of this document reported that the configured Groq endpoint
+returned **HTTP 403** and suggested it was "very likely the Phase 1
+credential-rotation blocker surfacing". **That diagnosis was wrong.** It is
+corrected here rather than quietly replaced, because the wrong conclusion was
+recorded and someone may have relied on it.
+
+**What was measured.** The same endpoint, model, and request shape, with three
+different credential states, run from the host:
+
+| Credential presented | Result |
+|---|---|
+| The configured key | `403 {"error":{"message":"Forbidden"}}` |
+| A syntactically valid but fake `gsk_` key | `403 {"error":{"message":"Forbidden"}}` |
+| **No `Authorization` header at all** | `403 {"error":{"message":"Forbidden"}}` |
+
+An unauthenticated request returning the same 403 as an authenticated one means
+the response carries **no information about the credential**. A rejected key
+would be a 401. The same host shows `pypi.org`, `github.com`, and `example.com`
+returning 200, `registry-1.docker.io` returning `403 RBAC: access denied`, and
+`api.telegram.org` refusing the connection. That is an **egress allowlist**, and
+the 403 was the proxy refusing the destination — not the application, not the
+credential, and not the provider.
+
+**What happens from inside a container**, which takes a different network path:
+
+| Request | Result |
+|---|---|
+| `GET /openai/v1/models`, no auth | `401 {"error":{"message":"Invalid API Key"}}` — a genuine Groq error |
+| `GET /openai/v1/models`, configured key | **`200`, 11 models listed** |
+| `POST /chat/completions`, `llama-3.3-70b-versatile` | **`404 model_not_found`** — "does not exist or you do not have access to it" |
+
+**Conclusion.** The API key is **valid**. The 404 rather than a 401 is the
+proof: the key authenticated and the request was refused afterwards. The
+configured model, `llama-3.3-70b-versatile`, has been **retired by the provider**
+and is absent from the 11 models the key can see. This was a configuration defect
+in the repository, not a credential problem and not a Phase 1 blocker.
+
+**The fix.** `LLM_MODEL` now names a model the provider serves.
+`qwen/qwen3.8-27b` was chosen from the available list after measuring all three
+general-purpose candidates: `openai/gpt-oss-120b` and `openai/gpt-oss-20b`
+returned HTTP 200 but with **empty content** and `finish_reason=length`, because
+they spend the output budget on reasoning tokens before answering — a poor fit
+for a chat bot that must produce visible text within `LLM_MAX_TOKENS`. The
+`whisper-*` and `*-prompt-guard-*` entries are not chat models. See `AD-028`.
+
+**What this changes about the Phase 1 blocker.** Credential rotation (Phase 1
+P0-3 / SR-4) remains open, and now with a sharper reason: the key in `.env` is
+not merely *exposed*, it is **live and working**, so it is a genuine
+disclosure risk rather than a theoretical one. It still requires a human with
+dashboard access. It is a Phase 1 item and is not part of this phase's
+Definition of Done; it is called out in § 14 as an open action, not as a Phase 2
+defect.
+
+### Not implemented, deliberately
+
+- **Web search, URL fetching, extraction, ranking, citations, reports.** Phase 3. No such module, import, or configuration exists.
+- **Document or file handling.** Phase 4.
+- **Projects, workspaces, tags, bookmarks.** Phase 5. Only the reserved `conversations.project_id` column exists (AD-015); no `projects` table and no behaviour.
+- **Multi-agent orchestration.** Phase 6. `app/agents/supervisor.py` is unchanged and still unused by the request path.
+- **Streaming.** Not required by this phase; long responses are chunked instead.
+- **Conversation summarization and semantic memory.** Explicitly excluded by § 4 and by the task's § 24. Truncation only (AD-022).
+- **Telegram webhook mode.** § 4 excludes it; long polling remains.
+- **A distributed rate limiter.** AD-012 stands; the counters are in-process.
+
+### Defects found during implementation
+
+Recorded because they are real findings, not decoration.
+
+| ID | Defect | Resolution |
+|---|---|---|
+| P2-1 | **A repository savepoint was silently unreliable.** Rolling a `SAVEPOINT` back while its parent transaction had issued no SQL still left the SQLAlchemy `Session` in a pending-rollback state, so the caller's commit failed with `PendingRollbackError`. Found by the end-to-end test, not by unit tests. | Measured against SQLAlchemy 2.0.36 + asyncpg. A uniqueness violation now aborts the enclosing unit of work and the caller resolves it. AD-019 |
+| P2-2 | **Message-cap truncation was invisible.** Dropping messages to satisfy `LLM_CONTEXT_MAX_MESSAGES` did not set the truncated flag, so the model was never told history was incomplete. Found by `test_truncation_is_surfaced_to_the_model`. | Both the count cap and the token budget now set `truncated` and emit the notice. `app/services/context.py` |
+| P2-3 | **The system prompt varied with history size.** It appended a message count, so its bytes were not constant and T-7's invariant did not hold literally. | The count was removed. The prompt is now a constant, versioned and checksummed (AD-023) |
+| P2-4 | **The test helper leaked locks and hung the suite.** An unclosed `AsyncSession` holds an `ACCESS SHARE` lock, so the next test's `TRUNCATE` blocked forever. | Sessions are closed, and the truncate sets `lock_timeout` so a future leak fails loudly instead of hanging |
+| P2-5 | **The migration environment skipped its own guard.** `ALEMBIC_REQUIRE_TEST_DB` did not exist, so the name check only ran when the URL already looked like a test database — a misspelled test database would have migrated a real one. | Replaced the inference with an explicit switch (AD-021) |
+| P2-9 | **Logging silently lost listeners, in two independent ways.** (a) `configure_logging()` called `root.handlers.clear()`, destroying any handler another component had attached. (b) Alembic's `fileConfig` defaults to `disable_existing_loggers=True`, and its config names no `app.*` logger — so running a migration muted the whole application logger tree. Both failed *silently*: records still reached the console, so nothing looked broken. Surfaced because a Phase 2 security assertion (SR-5, no message content in logs) passed or failed depending on which test module was imported first. A control whose result depends on import order is not a control. | (a) `configure_logging` now adds its handler without clearing others; the `_CONFIGURED` guard already provided FR-9.1, so nothing was lost. (b) `migrations/env.py` passes `disable_existing_loggers=False`. Two regression tests added. Verified order-independent in both directions and across repeat runs |
+| P2-7 | **Every secret scanner in the repository was blind to Groq keys.** The patterns used `gsk-` with a HYPHEN; Groq issues `gsk_` with an UNDERSCORE, so the alternative matched nothing. The repository scan **passed while a realistic `gsk_` key sat in `app/`**, and the CI scan would have passed too. Found by testing the control rather than trusting it. | Corrected in all three scanners (the shared pattern, the repository-wide scan, and the CI workflow). Added `test_the_secret_scanner_matches_realistic_key_shapes` with positive and negative controls, plus a check that the structural test's own pattern has the same coverage. Re-verified by injecting a leak: now detected |
+| P2-8 | **The configured model had been retired by the provider.** `LLM_MODEL=llama-3.3-70b-versatile` returns `404 model_not_found`. Combined with an egress proxy that masked it behind a uniform 403, this looked like a credential failure. | Model corrected to `qwen/qwen3.8-27b` after measuring the candidates. See the 403 section above and `AD-028` |
+| P2-6 | **Two Phase 1 tests reached a real broker.** `test_global_capacity_is_enforced_and_explained` and `test_user_rate_limit_is_enforced_after_allowance` did not stub the enqueue, so they failed whenever Redis was not running. | They now use the existing `enqueued` fixture. They were failing before this phase; the cause was a test defect, not a product defect, and it is fixed rather than suppressed |
+
+### Consistency trade-offs, stated rather than implied
+
+- **A turn is two transactions, not one** (AD-018). The consequence is that a
+  half-turn — a stored question with no reply — is a legitimate state. The retry
+  path detects it and answers it. The alternative, one transaction, would lose
+  the user's text on a provider outage, which § 15 forbids.
+- **This is not a distributed transaction.** The Telegram send happens outside
+  the database transaction. If delivery fails after a successful commit, the
+  reply is stored and the user did not receive it; a redelivery re-sends the
+  stored reply rather than generating a new one. The worst case is a stored
+  answer the user did not see, which their next message reveals.
+- **Idempotency covers one turn, not a whole conversation.** A redelivered
+  update produces no second reply. Two genuinely distinct messages with the same
+  content are two turns, because the key is the platform message id.
+- **The provider call is synchronous inside an async service.** The chat service
+  is async because persistence is; the LLM client is the synchronous OpenAI SDK
+  that Phase 1 established and this phase was told to reuse. In the Celery
+  worker this blocks the process loop for the duration of the call, which is
+  acceptable at `--concurrency=1` and equivalent to the pre-existing
+  `DeliveryService` pattern. It would need revisiting before the worker scales
+  concurrency within a process.
+- **Token counting is an estimate.** A character-ratio heuristic behind
+  `TokenEstimator`, deterministic and dependency-free, slightly conservative. A
+  real tokenizer replaces it without touching a caller. SR-8 holds because the
+  *recorded* usage comes from the provider, not from this estimate.
+
+### Validation actually performed
+
+| Check | Command | Result |
+|---|---|---|
+| Test suite | `pytest -q` | **368 passed**, 0 failed |
+| Lint | `ruff check app tests` | All checks passed |
+| Types | `mypy app` | Success, 44 source files |
+| Canonical gate | `make verify` | lint + typecheck + test, all pass |
+| Migration/model agreement | `alembic check` (dev and test databases) | No new upgrade operations detected, on both |
+| Migration round trip | `alembic downgrade base && alembic upgrade head` on the test database | base → head → base → head, all clean |
+| Migration round trip, isolated | `pytest tests/test_migrations_and_isolation.py` | 16 passed. Throwaway database: empty → head → base → head, tables and indexes verified at each step |
+| T-1 regression gate | `pytest tests/test_t1_event_loop_regression.py tests/test_t1_task_boundary.py` | 15 passed |
+| Compose validity | `docker compose config` | Valid |
+| **Docker image build** | `docker build` | **Succeeded.** The committed `Dockerfile` could not be built verbatim because this environment cannot reach Docker Hub (403 on every manifest). A throwaway copy differing **only** in its `FROM` line built and ran; the committed file was not modified. See "Docker verification" below |
+| **Migrations from inside the image** | `docker run … alembic upgrade head` | `0001_phase2 (head)`; all three tables created in a real container |
+| **API process in a container** | `docker run … uvicorn app.main:app` | Started. `GET /health` → **200**. `GET /ready` → **503 degraded**, `{"telegram_poller":"stopped","broker":"ok","database":"ok"}` — the Phase 2 database probe verified against real PostgreSQL, and the poller honestly reported dead |
+| **Celery worker in a container** | `docker run … celery worker` | `ready`, `process_research` registered, per-process event loop initialised, connected to Redis |
+| **Real provider, through the application** | `OpenAICompatibleClient.complete` against Groq | **Success.** Returned a validated `LLMReply` with real text and real token usage (37 prompt / 33 completion) |
+| **Real end-to-end, in containers** | two turns enqueued to a real worker | **Success up to the Telegram hop.** See below |
+| **Telegram delivery** | real `sendMessage` | **NOT VERIFIED — external.** `api.telegram.org` refuses the connection from both the host and the container. Every send raised `TelegramNetworkError`, which the application contained correctly |
+| **GitHub Actions** | `.github/workflows/ci.yml` | **Configured and locally validated; GitHub-hosted execution not verified in this environment.** The `gh` CLI is not installed and the workflow has not run |
+| **Secret scanning** | the scan, with an injected `gsk_` leak | Verified as a **positive and negative** control: it now detects a realistic Groq key and reports the real tree clean |
+
+### The real end-to-end run
+
+Performed in containers against real PostgreSQL, real Redis, and the live
+provider, using the committed image. Two turns were enqueued for one user
+exactly as the Telegram handler does.
+
+```text
+turn 1  user      "What is entropy?"
+        llm       qwen/qwen3.8-27b  tokens 206 prompt / 127 completion
+        assistant "Entropy is a measure of disorder or randomness in a system…"
+
+turn 2  user      "Why does it matter?"
+        llm       history=2  tokens 351 prompt / 197 completion
+        assistant "Entropy matters because it dictates the direction of time…"
+```
+
+| Requirement | Evidence |
+|---|---|
+| User message persisted | `messages` rows 1 and 3, `role='user'` |
+| Correct conversation selected | both turns in conversation 1; one `users` row, one `conversations` row |
+| Prior history included | turn 2's request reported `history=2`; its answer refers to the first turn |
+| Provider returns successfully | HTTP 200, two successful completions |
+| Response passes domain validation | both replies stored as validated assistant messages, not raw payloads |
+| Assistant message persisted | `messages` rows 2 and 4 |
+| Token usage recorded | `prompt_tokens`/`completion_tokens` populated per assistant message; `model` recorded |
+| Exactly one assistant reply per turn | `GROUP BY turn_id` → 2 turns, 1 reply each, **despite a Celery retry** |
+| No duplicate response | the retry logged `duplicate turn rejected by the database: DuplicateMessageError` and wrote nothing |
+| Telegram delivery | **NOT VERIFIED** — egress blocked, `TelegramNetworkError` |
+
+The delivery failure also demonstrated the retry policy working: `DeliveryError`
+is retryable, so the task rescheduled rather than messaging the user on an
+attempt that would be retried, and the redelivery did not create a second reply.
+
+### Docker verification, in full
+
+The committed `Dockerfile` and `docker-compose.yml` are unmodified by this
+verification. The registry block is environmental:
+
+| Step | Outcome |
+|---|---|
+| `docker build` with the committed file | **Failed** — `# syntax=docker/dockerfile:1` and `python:3.12-slim` both 403 from Docker Hub |
+| `docker build` with a locally available base image, `# syntax` removed | **Succeeded** |
+| Image run as API, worker, and migration tool | All three ran correctly |
+| `docker compose up -d redis postgres` | `redis` healthy; `postgres` could not bind `127.0.0.1:5432` because the host's own PostgreSQL already holds that port |
+
+`postgres:16-alpine` and a Python base image were present in the local image
+store, which is why a build was possible at all. Two host conflicts were worked
+around **without editing any configuration**: a separate docker network, and a
+port already in use.
+
+### Known limitations, recorded deliberately
+
+- **Rate limiting and the daily allowance are in-process.** Correct for a single
+  API process; the counters stop being global if the API tier scales
+  horizontally. AD-012 and AD-025.
+- **The daily allowance counts requests, not tokens.** FR-28 is satisfied by a
+  request count. A token-weighted allowance would need the recorded usage summed
+  per user per day, which is available (`total_tokens_for_user`) but is not
+  wired, because FR-28 permits either.
+- **`conversations.project_id` has no foreign key and no behaviour.** It is a
+  reserved column (AD-015). Nothing reads or writes it.
+- **The Celery task is named `process_research` and lives in `research_task.py`**,
+  although it runs the chat flow. Inherited from Phase 1 under the no-rename
+  rule; recorded as AD-027.
+- **`app/agents/supervisor.py` and `analyze_query` are retained but unused** by
+  the request path. Phase 3 needs the decomposition capability, so removing it
+  now would delete a capability this phase is not entitled to replace (AD-026).
+- **User-facing strings are hardcoded English literals** (audit L-2). Unchanged
+  from Phase 1; i18n remains Phase 7.
+- **No conversation export or deletion API.** SR-9 unmet, as above.
+
+### Update procedure
+
+When an item is completed:
+
+1. Set its status in the tables above.
+2. Tick the corresponding acceptance criterion in § 10.
+3. Update the phase status table in `docs/PROJECT_PLAN.md`.
+4. Record any decision in the Architecture Decision Log.
+5. If `docs/ARCHITECTURE.md` is updated, keep its audit findings intact as the
+   pre-Phase-1 baseline and add a dated note rather than rewriting them.

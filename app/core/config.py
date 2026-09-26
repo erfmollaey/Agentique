@@ -49,14 +49,42 @@ class Settings(BaseSettings):
 
     # --- AI provider: OpenAI-compatible endpoint ---------------------------
     GROQ_API_KEY: SecretStr
-    LLM_BASE_URL: str = "https://api.deepseek.com/v1"
-    LLM_MODEL: str = "deepseek-chat"
+    # Defaults are the values Phase 2 validated against the live endpoint. The
+    # endpoint default is overridden in `.env`; the model default matches a model
+    # the provider actually serves, so a fresh install is not pointed at a
+    # retired one.
+    LLM_BASE_URL: str = "https://api.groq.com/openai/v1"
+    LLM_MODEL: str = "qwen/qwen3.8-27b"
+    # Which provider implementation to build. The value selects a branch in
+    # app.infrastructure.llm.create_llm_client and is the documented extension
+    # point that makes the choice reversible (FR-16, T-6). Adding a provider
+    # means adding a branch there, not changing the service layer.
+    LLM_PROVIDER: str = "openai_compatible"
 
     # --- AI provider reliability (H-3, P0-11, P0-12) -----------------------
     LLM_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0)
     LLM_MAX_TOKENS: int = Field(default=1024, gt=0)
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+
+    # --- Model fallback chain (FR-32, FR-33, FR-34) ------------------------
+    # Comma-separated, tried in order, only for retryable failures. Bounded by
+    # LLM_FALLBACK_MAX_ATTEMPTS so a persistent failure cannot multiply cost.
+    LLM_FALLBACK_MODELS: str = ""
+    LLM_FALLBACK_MAX_ATTEMPTS: int = Field(default=1, ge=0, le=5)
+
+    # --- Conversation context policy (FR-8, FR-9, FR-10) -------------------
+    # A configuration decision, not a hardcoded constant (FR-9). The strategy is
+    # a recent-window truncation: the newest LLM_CONTEXT_MAX_MESSAGES are kept,
+    # then the oldest are dropped until the estimated total fits
+    # LLM_CONTEXT_MAX_TOKENS. No summarization and no embeddings.
+    LLM_CONTEXT_MAX_MESSAGES: int = Field(default=20, ge=2)
+    LLM_CONTEXT_MAX_TOKENS: int = Field(default=4000, gt=0)
+    # Divisor for the deterministic token estimate. See app.services.context.
+    LLM_CHARS_PER_TOKEN: float = Field(default=4.0, gt=0)
+    # Hard cap on one inbound user message, applied before persistence so an
+    # oversized message cannot reach the provider or the database.
+    CHAT_MAX_MESSAGE_CHARS: int = Field(default=4000, gt=0)
 
     # --- Celery (H-3, M-9, P0-13, P1-9) ------------------------------------
     REDIS_URL: str
@@ -70,6 +98,10 @@ class Settings(BaseSettings):
     RATE_LIMIT_MAX_REQUESTS: int = Field(default=5, gt=0)
     RATE_LIMIT_WINDOW_SECONDS: int = Field(default=60, gt=0)
     MAX_IN_FLIGHT_REQUESTS: int = Field(default=8, gt=0)
+    # Daily allowance per user (FR-28). Enforced by the same in-process limiter
+    # as the sliding window, not by a second limiter (AD-012).
+    RATE_LIMIT_DAILY_MAX_REQUESTS: int = Field(default=200, gt=0)
+    RATE_LIMIT_DAILY_WINDOW_SECONDS: int = Field(default=86400, gt=0)
 
     # --- Telegram output (C-4, P0-8, P0-9) --------------------------------
     TELEGRAM_PARSE_MODE: str = "HTML"
@@ -79,10 +111,17 @@ class Settings(BaseSettings):
     HEALTH_PROBE_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0)
     LOG_LEVEL: str = "INFO"
 
-    # --- Declared, not yet used -------------------------------------------
-    # PostgreSQL is provisioned in docker-compose but no database code exists.
-    # Optional so its absence cannot crash the process (M-6). Wired in Phase 2.
-    DATABASE_URL: str | None = None
+    # --- Persistence (Phase 2 § 6) -----------------------------------------
+    # Required as of Phase 2: the chat flow cannot run without it, and leaving
+    # it optional would let the process start and then fail on first use.
+    DATABASE_URL: str
+    DATABASE_ECHO: bool = False
+    DATABASE_POOL_SIZE: int = Field(default=5, gt=0)
+    DATABASE_POOL_MAX_OVERFLOW: int = Field(default=5, ge=0)
+    # Test-only. The database the suite is permitted to touch. Its name must end
+    # in "_test"; app.db.session refuses anything else, so a misconfigured value
+    # fails loudly instead of truncating real data (Phase 2 § 23).
+    TEST_DATABASE_URL: str | None = None
 
     # --- Deployment mode ----------------------------------------------------
     ENVIRONMENT: str = "development"
