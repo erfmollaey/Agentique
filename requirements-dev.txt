@@ -5,3 +5,8 @@
 
 pytest==8.3.4
 pytest-asyncio==0.25.0
+
+# Lint / typecheck. Required by `make lint` (ruff) and `make typecheck` (mypy);
+# previously only present in ad-hoc local venvs, so CI never had them.
+ruff==0.16.9
+mypy==2.3.1
