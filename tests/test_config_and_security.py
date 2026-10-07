@@ -143,13 +143,19 @@ def test_t10_settings_resolve_regardless_of_working_directory(tmp_path):
 
 # --- T-10 / FR-1.6: readable failure on missing configuration --------------
 
-def test_t10_missing_required_variable_is_a_validation_error():
+def test_t10_missing_required_variable_is_a_validation_error(monkeypatch):
     """FR-1.6: with no env file and no kwargs, the required field is enforced.
 
     ``_env_file=None`` bypasses the real ``.env`` so the missing-value path is
-    what actually gets exercised.
+    what actually gets exercised. The process environment must also be cleared,
+    otherwise a globally exported ``DATABASE_URL`` (as CI sets for the
+    integration steps) silently satisfies the required fields and no
+    ``ValidationError`` is raised.
     """
     from pydantic import ValidationError
+
+    for name in ("BOT_TOKEN", "GROQ_API_KEY", "REDIS_URL", "DATABASE_URL", "TEST_DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
 
     with pytest.raises(ValidationError) as info:
         Settings(_env_file=None)
@@ -184,7 +190,7 @@ def test_t10_settings_expose_llm_and_reliability_configuration(settings):
     assert settings.TELEGRAM_MAX_MESSAGE_LENGTH <= 4096
 
 
-def test_t10_database_url_is_required_and_optional_settings_stay_optional():
+def test_t10_database_url_is_required_and_optional_settings_stay_optional(monkeypatch):
     """Phase 2 inverted the Phase 1 rule for DATABASE_URL.
 
     It was optional in Phase 1 precisely because nothing consumed it. Phase 2
@@ -195,6 +201,13 @@ def test_t10_database_url_is_required_and_optional_settings_stay_optional():
     environment.
     """
     from pydantic import ValidationError
+
+    # A globally exported DATABASE_URL (CI sets one for the integration steps)
+    # would otherwise satisfy the field and mask the required-field check.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    # CI exports TEST_DATABASE_URL globally; the "stays optional" assertion
+    # below requires it to be unset in this test.
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
 
     with pytest.raises(ValidationError) as info:
         Settings(
