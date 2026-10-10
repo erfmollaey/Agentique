@@ -123,12 +123,282 @@ class Settings(BaseSettings):
     # fails loudly instead of truncating real data (Phase 2 § 23).
     TEST_DATABASE_URL: str | None = None
 
+    # --- Web search (Phase 3, P3.2, AD-036) -------------------------------------
+    # The Research Engine searches through the `SearchProvider` port. Which
+    # concrete provider is built is configuration, selected by a branch in
+    # app.infrastructure.search.create_search_provider — the same extension point
+    # shape as LLM_PROVIDER (FR-16, T-3). Two adapters exist ("brave",
+    # "tavily"); "tavily" is the default now that a usable credential for it
+    # exists, and the Brave adapter remains registered behind the port so the
+    # configuration can be switched back without a code change.
+    SEARCH_PROVIDER: str = "tavily"
+    # The provider credential. Optional at the settings level on purpose: nothing
+    # searches yet (the research pipeline is P3.9), so a deployment that does not
+    # research must still start. The factory refuses to build a provider without
+    # it, so the failure lands where search is actually used rather than at
+    # startup — and it is a configuration failure, never a silent no-op (FR-6).
+    SEARCH_API_KEY: SecretStr | None = None
+    # Result count per query. Bounded (SR-5): one query can never ask for an
+    # unbounded response, and every stage downstream of this inherits the bound.
+    SEARCH_MAX_RESULTS: int = Field(default=5, ge=1, le=20)
+    # Client-side deadline for one provider call. Explicit rather than inherited
+    # from the LLM timeout (P0-11): a search call is cheap, fast, and on the
+    # critical path of a run whose own budget is finite (FR-44).
+    SEARCH_TIMEOUT_SECONDS: float = Field(default=15.0, gt=0)
+    # Language and market hints for queries that do not carry their own. Empty
+    # by default: a search request is built from the user's own question, and the
+    # pipeline must not silently bias it toward one market.
+    SEARCH_LANGUAGE: str = ""
+    SEARCH_REGION: str = ""
+    # Safe search. "strict" by default because the product serves arbitrary
+    # user questions in a public chat (SR-2); a provider that cannot honour the
+    # level is not a usable adapter.
+    SEARCH_SAFE_SEARCH: str = "strict"
+
+    # --- Web fetching (Phase 3, P3.3, AD-031) ---------------------------------
+    # The SSRF boundary. Every one of these is a bound the fetch stage enforces
+    # on untrusted URLs, and none of them can be turned off by configuration —
+    # `create_fetch_client` refuses to build if they are unset or nonsensical.
+    # The frozen contract (§ 15.5) requires them to be configurable, so they are
+    # settings rather than constants; the *policy* (which addresses are reachable
+    # at all) is not configurable, because a configuration value that can permit
+    # `10.0.0.0/8` is not a security control.
+    #
+    # Allowed schemes. Narrowing is permitted; widening is not. A value naming
+    # `file` or `gopher` raises at construction rather than being honoured, so a
+    # typo cannot quietly widen what the process will fetch (FR-13).
+    FETCH_ALLOWED_SCHEMES: str = "http,https"
+    # Media types the pipeline processes, checked before any body is read
+    # (FR-17). Extending this is a decision for the extraction stage; the
+    # default is the frozen minimum.
+    FETCH_ALLOWED_CONTENT_TYPES: str = "text/html,text/plain"
+    # Three separate bounds, because a single timeout cannot express them: a
+    # connect timeout stops a black-holed address, a read timeout stops a slow
+    # body, and the total deadline stops a body that dribbles just inside the
+    # read timeout forever (FR-18). The total is the one that actually bounds
+    # the operation.
+    FETCH_CONNECT_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0)
+    FETCH_READ_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0)
+    FETCH_TOTAL_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
+    # Hard ceiling on the *decoded* body, enforced while streaming. Bounded
+    # because a chunked response has no Content-Length and a compressed one
+    # describes its compressed size (FR-16, SR-5).
+    FETCH_MAX_RESPONSE_BYTES: int = Field(default=5_000_000, gt=0)
+    # Second decompression defence: even a body under the byte cap may not
+    # expand past this multiple of its wire size. A 5 MB ceiling alone would
+    # still permit ~1 GB of allocation from a 5 KB gzip stream.
+    FETCH_MAX_COMPRESSION_RATIO: int = Field(default=200, gt=0)
+    # Redirect depth. Each hop costs a full validation round, so this bounds both
+    # work and the number of SSRF attempts a single URL can provoke (FR-15).
+    FETCH_MAX_REDIRECTS: int = Field(default=5, ge=0, le=20)
+    # Identifies the client to origins. Not a secret and not a credential; it
+    # exists so an operator can recognise research traffic in origin logs.
+    FETCH_USER_AGENT: str = "telegram-research-bot/1.0 (+research-fetch)"
+    # Connection pool sizing. Small on purpose: the fetcher is not a crawler and
+    # an unbounded pool is a resource-exhaustion surface of its own.
+    FETCH_MAX_CONNECTIONS: int = Field(default=10, gt=0)
+    FETCH_MAX_KEEPALIVE_CONNECTIONS: int = Field(default=5, ge=0)
+    FETCH_KEEPALIVE_EXPIRY_SECONDS: float = Field(default=5.0, ge=0)
+
+    # --- Fetch DNS resolution (Phase 3, P3.3, AD-031) -------------------------
+    # How the fetch boundary turns a hostname into addresses to validate.
+    #
+    # "system" is the platform getaddrinfo — the default, unchanged behaviour,
+    # and correct wherever the platform resolver answers honestly.
+    #
+    # "doh" resolves through a DNS-over-HTTPS endpoint instead. It exists for one
+    # measured situation: a host whose network intercepts outbound UDP/53 and
+    # rewrites every answer to a non-routable fake IP (Tailscale MagicDNS and
+    # similar fake-IP pools return 198.18.0.0/15 — RFC 2544 benchmarking — which
+    # the SSRF boundary then correctly refuses). HTTPS is not rewritten, so the
+    # answers come back real and globally routable, and the address policy stays
+    # exactly as it is. This is strictly better than relaxing the policy: the
+    # boundary is untouched and the deployment opts in.
+    #
+    # Not a fallback. A deployment either resolves honestly through the platform
+    # or says so here; there is no "try both", because a resolver that silently
+    # disagrees with itself is worse than one that fails.
+    FETCH_DNS_MODE: str = "system"
+    # The RFC 8484 endpoint used when FETCH_DNS_MODE=doh. Any DoH provider works;
+    # the wire format is the standard one, so this is not a vendor API.
+    FETCH_DOH_ENDPOINT: str = "https://cloudflare-dns.com/dns-query"
+    # Bound on one DNS-over-HTTPS round trip. The fetch timeout is not reused on
+    # purpose: a resolver that hangs must not consume a fetch's whole budget.
+    FETCH_DOH_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0)
+
+
+    # The extractor interface. Only one implementation exists (trafilatura);
+    # adding another requires a branch in the factory, not a domain change.
+    EXTRACT_EXTRACTOR: str = "trafilatura"
+    # Upper bound on extracted text length (SR-5). Beyond this content is
+    # truncated with an explicit marker rather than dropped silently.
+    EXTRACT_MAX_CHARS: int = Field(default=100_000, gt=0)
+    # Minimum readable characters to consider a result non-empty (FR-23).
+    EXTRACT_MIN_CHARS: int = Field(default=10, ge=0)
+
+    # --- Deduplication and ranking (Phase 3, P3.5) ---------------------------
+    # Identity rules for collapsing candidates. Both default on; either may be
+    # turned off, and each turning one off is a deliberate loss of recall rather
+    # than a performance knob:
+    #   * `DEDUP_GROUP_BY_URL` collapses equal canonical URLs — the only rule that
+    #     still works when extraction failed for a source.
+    #   * `DEDUP_GROUP_BY_CONTENT` collapses equal extracted-content fingerprints
+    #     — the only rule that catches syndicated copies at different URLs (FR-24),
+    #     and safe from the FR-25 boilerplate problem because it compares P3.4's
+    #     extracted main content, never the raw page.
+    DEDUP_GROUP_BY_URL: bool = True
+    DEDUP_GROUP_BY_CONTENT: bool = True
+    # Minimum extraction quality a source must reach to be kept (FR-30). Below it
+    # the source is *recorded as excluded with a reason*, not silently dropped, so
+    # a later stage can still count and explain it (FR-42).
+    RANKING_MIN_QUALITY: float = Field(default=0.10, ge=0.0, le=1.0)
+
+    # --- Research planning (Phase 3, P3.6) ---------------------------------
+    # Every planning limit is a cost or latency bound, which is why they are
+    # configuration rather than constants: each one becomes at least one provider
+    # call or one stage of waiting downstream, so the right value is an
+    # operational judgement an operator can change without a code edit.
+    #
+    # Steps per plan. `ResearchPlan` also enforces a hard structural ceiling
+    # (MAX_STEPS_CEILING in app/domain/research/planning.py) that configuration
+    # cannot raise, so a misconfigured value cannot permit an unbounded plan.
+    PLAN_MAX_STEPS: int = Field(default=6, ge=1, le=25)
+    # Bound on the research question itself. Keeps the prompt bounded (a large
+    # unbounded prompt is both a cost and a context-window hazard) and rejects an
+    # input that is not a question before any model call is made.
+    PLAN_MAX_QUESTION_CHARS: int = Field(default=2_000, gt=0)
+    # Output bound for the planning call. Larger than LLM_MAX_TOKENS because a plan
+    # is structurally longer than a chat reply; separate so raising the chat bound
+    # does not silently change what planning can produce.
+    PLAN_MAX_TOKENS: int = Field(default=1_500, gt=0)
+
+    # --- Per-source summarization and claim extraction (Phase 3, P3.7) -------
+    # Same reasoning as the planning limits: each of these is a cost or latency
+    # bound, and each becomes provider calls downstream. P3.7 makes
+    # 1 + CLAIM_MAX_WINDOWS calls per source, so these multiply by the number of
+    # selected sources — which is why they are explicit rather than inherited from
+    # the chat bounds (a chat reply has nothing in common with a structured
+    # evidence extraction).
+    #
+    # Input budget for the summary call, in estimated tokens. Whole passages only,
+    # and `plan_chunk_windows` reports how many did not fit, so a summary of a
+    # long source is marked truncated rather than silently covering part of it
+    # (§ 16, FR-42).
+    SUMMARY_MAX_INPUT_TOKENS: int = Field(default=4_000, gt=0)
+    # Output bound for the summary call.
+    SUMMARY_MAX_TOKENS: int = Field(default=800, gt=0)
+    # Input budget for ONE claim-extraction call, in estimated tokens. A window is
+    # built from whole passages to fit this, so a quote the model reads is a quote
+    # that can be verified afterwards — evidence is never cut mid-passage.
+    CLAIM_MAX_INPUT_TOKENS: int = Field(default=4_000, gt=0)
+    # Output bound for the claim-extraction call.
+    CLAIM_MAX_TOKENS: int = Field(default=1_200, gt=0)
+    # Hard ceiling on windows (provider calls) per source. A source with more
+    # passages than this budget can show has its remainder *counted* as uncovered
+    # evidence, never silently skipped.
+    CLAIM_MAX_WINDOWS: int = Field(default=4, ge=1, le=20)
+    # Claims requested from one call. `MAX_CLAIMS_CEILING` in
+    # app/domain/research/evidence.py is the structural ceiling this cannot
+    # exceed.
+    CLAIM_MAX_CLAIMS: int = Field(default=8, ge=1, le=20)
+
+    # --- Research execution bounds (Phase 3, P3.9-D; AD-047, § B5-P2) ---------
+    #
+    # Three separate quantities were conflated before this stage, and § S.3.4
+    # named the conflation as the reason no deadline value could be derived:
+    #
+    #   candidates — how many distinct URLs the plan's queries surface
+    #   fetched    — how many of those the pipeline actually retrieves
+    #   selected   — how many survive ranking and reach the evidence stage
+    #
+    # ``RESEARCH_MAX_SOURCES`` bounds the **middle one**, because that is where the
+    # expensive work begins: a fetch costs up to ``FETCH_TOTAL_TIMEOUT_SECONDS`` of
+    # wall clock, and every source selected for evidence costs
+    # ``1 + CLAIM_MAX_WINDOWS`` model calls. Bounding the *candidates* alone would
+    # still leave the fetch count a function of ``SEARCH_MAX_RESULTS × plan steps``;
+    # bounding the *selected* alone would bound the cost but not the wall clock,
+    # which is what a deadline has to reason about.
+    #
+    # The same bound is applied at ranking, so a run with more surviving sources
+    # than the budget keeps its highest-ranked ones and records the rest as excluded
+    # with a reason (FR-30) rather than dropping them silently (FR-42).
+    #
+    # **The default requires measurement before production confidence** (§ S.7).
+    # 5 is the conservative choice for a documented operational reason rather than a
+    # number picked to look deliberate: it equals ``SEARCH_MAX_RESULTS``, the
+    # per-query bound P3.2 already justified, so a default run's work stays inside
+    # "what one search step offers" no matter how many steps the plan contains. It
+    # is **not** a claim that 5 sources answer a question well, that a run of 5
+    # finishes inside any deadline, or that 5 is the right number — none of those has
+    # been measured, because no run has ever executed (``SEARCH_API_KEY`` is absent
+    # from this environment, § S.7).
+    RESEARCH_MAX_SOURCES: int = Field(default=5, ge=1, le=20)
+
+    # The cooperative run deadline (AD-045, FR-44). **Unset by default, and that
+    # is the honest state of it.**
+    #
+    # No measurement exists: wall-clock duration per stage has never been recorded,
+    # the number of sources a run fetches had no bound until this stage, and no
+    # credentialed end-to-end run has executed (audit § S.7). A number chosen here
+    # would look deliberate and be unmeasurable, which is precisely the failure § S.7
+    # was written to prevent.
+    #
+    # So the setting exists and defaults to disabled. The *mechanism* is implemented
+    # and tested (``app.domain.research.outcome.CooperativeDeadline``); the value is
+    # left explicit as an operator decision. A deployment that never sets this has
+    # no cooperative deadline, and runs are then bounded by the per-provider
+    # timeouts (search 15 s, fetch 30 s total, LLM 60 s), the candidate bound above,
+    # and Celery's own limits — a state the audit records rather than hides.
+    #
+    # Do not "fix" the None default by inventing a value; measure a run first.
+    RESEARCH_DEADLINE_SECONDS: int | None = Field(default=None, gt=0)
+
+    # --- Cross-source synthesis and citations (Phase 3, P3.8) ----------------
+    # Same reasoning as the planning and P3.7 limits: each of these is a cost,
+    # latency, or output bound, and each is an operational judgement an operator can
+    # change without a code edit. P3.8 makes exactly ONE provider call per run, so
+    # unlike P3.7 these do not multiply by the number of sources — which is what makes
+    # cross-source synthesis affordable, and also why the evidence budget below is
+    # the sharpest bound in this file: it is the only thing standing between a
+    # twenty-source run and a prompt the model cannot read.
+    #
+    # Input budget for the synthesis call, in estimated tokens. What is offered is
+    # "verified claim + verified quote + source metadata", never whole fetched pages,
+    # and the highest-ranked evidence is offered first. What does not fit is
+    # *counted* and reported on the result, never silently dropped, so an answer
+    # synthesized from a truncated context can be distinguished from a complete one
+    # (FR-42, SR-12).
+    SYNTHESIS_MAX_INPUT_TOKENS: int = Field(default=8_000, gt=0)
+    # Evidence items offered to one call. `MAX_EVIDENCE_CEILING` in
+    # app/domain/research/synthesis.py is the structural ceiling this cannot exceed.
+    SYNTHESIS_MAX_EVIDENCE: int = Field(default=30, ge=1, le=120)
+    # Sections requested from one call. A section is the unit of citation
+    # completeness (FR-36): each must name at least one citation that resolves, so
+    # this bounds both the output and the number of units that must verify.
+    # `MAX_SECTIONS_CEILING` is the structural ceiling.
+    SYNTHESIS_MAX_SECTIONS: int = Field(default=6, ge=1, le=20)
+    # Output bound for the synthesis call. Larger than LLM_MAX_TOKENS because a
+    # structured multi-section answer is structurally longer than a chat reply, and
+    # separate so raising the chat bound does not silently change what synthesis can
+    # produce.
+    SYNTHESIS_MAX_TOKENS: int = Field(default=2_000, gt=0)
+
     # --- Deployment mode ----------------------------------------------------
     ENVIRONMENT: str = "development"
 
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT.lower() in {"production", "prod"}
+
+    @property
+    def search_enabled(self) -> bool:
+        """Whether search can actually run.
+
+        True only when a provider is selected *and* a credential is present.
+        Callers that need search fail loudly instead of silently degrading when
+        this is False (SR-12).
+        """
+        return bool(self.SEARCH_PROVIDER.strip()) and self.SEARCH_API_KEY is not None
 
 
 @lru_cache(maxsize=1)

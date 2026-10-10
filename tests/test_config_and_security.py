@@ -88,21 +88,42 @@ def test_sr3_env_example_exists_and_contains_no_real_values():
         "redis://localhost",
         "postgresql+asyncpg://USER:PASSWORD@",
         "https://api.groq.com/openai/v1",
+        # Phase 3 P3.3: the public DNS-over-HTTPS endpoint. A documented default
+        # the operator replaces with their own resolver; it carries no credential.
+        "https://cloudflare-dns.com/",
         "qwen/qwen3.8-27b",
         # A documented enum value, not a credential.
         "openai_compatible",
+        # Phase 3 P3.2: the documented search-provider enum value and the
+        # safe-search level. Both are enumerated choices, not credentials.
+        "brave",
+        "tavily",
+        "strict",
+        # Phase 3 P3.3: the fetch resolver mode. An enumerated "system"/"doh"
+        # choice, never a value that can carry a credential.
+        "system",
         # An explicit placeholder, not a chosen password; and a database name.
         "USER",
         "PASSWORD",
         "research_db",
+        # Phase 3 P3.5: boolean policy switches. A boolean carries no credential,
+        # and these are the same enumerated on/off choice as the safe-search level
+        # above rather than a secret.
+        "true",
+        "false",
     )
     for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         value = line.split("=", 1)[1].strip()
+        # A purely numeric value is a count, a bound, or a timeout — it cannot
+        # carry a credential, and it is how numeric settings are documented
+        # elsewhere in this file (``REDIS_URL=redis://localhost:6379/0`` embeds
+        # one too).
+        is_numeric = value.replace(".", "", 1).isdigit()
         assert (
-            value == "" or value.startswith(safe_prefixes)
+            value == "" or value.startswith(safe_prefixes) or is_numeric
         ), f".env.example line looks like it carries a real value: {line!r}"
 
 
