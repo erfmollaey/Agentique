@@ -802,3 +802,31 @@ The graph's own clustering confirms the architecture is two disconnected islands
 ---
 
 *End of audit. This document was produced under read-only constraints: no files in the application were modified, created, or deleted; no packages were installed; no migrations were run; no configuration or environment variables were changed; no commits were made. The only filesystem change is the creation of this `docs/` directory and this file.*
+
+---
+
+## AD-048 — DNS resolution for the fetch boundary
+
+**Status:** `FetchBlockedDestinationError` on every fetch, with search, planning
+and evidence working. Not a policy bug — the boundary was correct and was
+reporting a true fact. Full record:
+[`adr/000048-fetch-dns-over-https.md`](./adr/000048-fetch-dns-over-https.md).
+
+**AD-048 — the resolver is configurable; the policy is not.** The host's DNS
+rewrites every UDP/53 answer into `198.18.0.0/15` (RFC 2544 benchmarking — a
+fake-IP layer such as Tailscale MagicDNS), so a real public domain resolves to a
+non-routable address and the SSRF boundary refuses it, correctly. Rather than
+remove the blocklist entry — which would also defend against a real attack, and
+which would not work on a host without a matching transparent proxy — resolution
+moves behind a setting. `FETCH_DNS_MODE=system` (default) uses the platform
+`getaddrinfo` exactly as before; `doh` resolves over HTTPS, which is not
+rewritten on those networks, so the answers are real and pass the policy on
+their own merits. `ssrf.py` is untouched: the choice is which resolver runs,
+never which addresses are permitted. `FETCH_DNS_SERVERS` is an ordered list with
+at least two operators, and falls back only when an endpoint cannot be reached or
+understood — an answer of "no records" is used as given, because a masked NXDOMAIN
+is not something a deployment can reason about.
+
+**The stated limit.** If a future environment also rewrites HTTPS, DoH will not
+help. The fix then belongs on the host, in the DNS interception, and must not be
+found by loosening the SSRF policy.
