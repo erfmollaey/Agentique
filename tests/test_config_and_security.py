@@ -102,6 +102,12 @@ def test_sr3_env_example_exists_and_contains_no_real_values():
         # Phase 3 P3.3: the fetch resolver mode. An enumerated "system"/"doh"
         # choice, never a value that can carry a credential.
         "system",
+        "doh",
+        "false",
+        # The bot-polling split (P3.9-E). An enumerated choice plus a container
+        # runtime path. Neither carries a credential: the path is where the
+        # poller's healthcheck file lives, and it is not a secret.
+        "/tmp/",
         # An explicit placeholder, not a chosen password; and a database name.
         "USER",
         "PASSWORD",

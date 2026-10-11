@@ -44,7 +44,7 @@ touch the database but never the provider.
 | Application | `app/services/` | Chat orchestration, context assembly, system prompt, formatting, delivery, rate limiting, health. |
 | Domain | `app/domain/` | Pure types, errors, and the ports the application depends on. No I/O. |
 | Persistence | `app/db/`, `app/repositories/` | The only place SQLAlchemy is imported. |
-| Infrastructure | `app/infrastructure/` | Event loop, AI client and provider factory, Telegram factory. |
+| Infrastructure | `app/infrastructure/` | Event loop, AI client and provider factory, Telegram factory, search adapter and its factory (Phase 3). |
 | Tasks | `app/tasks/` | Celery entry points and worker lifecycle. |
 | Config | `app/core/` | Settings, logging, Celery app. |
 
@@ -74,9 +74,17 @@ A user may hold many conversations; the active one is the most recently updated
 | `/delete_account` | Asks for confirmation. Nothing is deleted yet. |
 | `/delete_account confirm` | **Irreversible.** Deletes your account and everything stored about you: every conversation and every message in them. |
 | `/delete_account cancel` | Cancels. Nothing is deleted. |
+| `/research <question>` | Starts a research run: search the web, read sources, and
+answer with citations. One acknowledgement, then one terminal message. The question
+is bounded by `PLAN_MAX_QUESTION_CHARS` (2000); a question longer than that is
+rejected with no run created. |
 
 Any other `/command` is answered with a pointer to `/help` rather than treated as
 chat text.
+
+> `/research` is a Phase 3 capability implemented at P3.9-D; the
+> `RESEARCH_MAX_SOURCES` allowance is described in the configuration table, and
+> the deadline value is measurement-gated (see [`docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md) § U.4).
 
 ---
 
@@ -132,7 +140,9 @@ cp .env.example .env      # then fill in the values
 | `RATE_LIMIT_WINDOW_SECONDS` | no | `60` | Throttle window |
 | `RATE_LIMIT_DAILY_MAX_REQUESTS` | no | `200` | Per-user daily allowance |
 | `RATE_LIMIT_DAILY_WINDOW_SECONDS` | no | `86400` | Daily allowance window |
-| `MAX_IN_FLIGHT_REQUESTS` | no | `8` | Global concurrency cap |
+| `MAX_IN_FLIGHT_REQUESTS` | no | `8` | Global concurrency cap (unmeasured cross-process leak; B6-P4) |
+| `RESEARCH_MAX_SOURCES` | no | `5` | Fetched and selected candidates per run (1..20) |
+| `RESEARCH_DEADLINE_SECONDS` | no | `None` | Cooperative deadline per run (unbounded when unset); number is measurement-gated |
 | `CELERY_TASK_TIME_LIMIT` | no | `120` | Hard task limit (s) |
 | `CELERY_TASK_SOFT_TIME_LIMIT` | no | `100` | Soft task limit (s) |
 | `CELERY_TASK_MAX_RETRIES` | no | `2` | Bounded retries |
@@ -140,6 +150,25 @@ cp .env.example .env      # then fill in the values
 | `HEALTH_PROBE_TIMEOUT_SECONDS` | no | `2.0` | Readiness probe timeout |
 | `LOG_LEVEL` | no | `INFO` | Root log level |
 | `ENVIRONMENT` | no | `development` | Deployment mode |
+| `SEARCH_PROVIDER` | no | `tavily` | Which search adapter `create_search_provider` builds (`brave` or `tavily`) |
+| `SEARCH_API_KEY` | no | unset | Search provider API key. Optional because nothing searches yet; the factory refuses to build a provider without it |
+| `SEARCH_MAX_RESULTS` | no | `5` | Results requested per query (max 20) |
+| `SEARCH_TIMEOUT_SECONDS` | no | `15.0` | Client-side deadline for one provider call |
+| `SEARCH_LANGUAGE` | no | unset | Language hint for queries that carry none |
+| `SEARCH_REGION` | no | unset | Market hint for queries that carry none |
+| `SEARCH_SAFE_SEARCH` | no | `strict` | `off`, `moderate`, or `strict` |
+
+> **Web search is a Phase 3 capability.** The research command, orchestrator, and
+> one-Celery-task-per-run execution now run end to end from a real command to a
+> verified answer, and the adapter makes no unauthenticated network call in the
+> repository. The number of candidates per run is bounded (`RESEARCH_MAX_SOURCES`)
+> and every citation is verified against persisted evidence, but **a research run
+> has not been measured end to end with credentials** — so the deadline and rate
+> limit values are measurement-gated, and the provider was chosen on reachability
+> and documented contracts, not on measured quality. See
+> [`docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md)
+> § K, which also records the candidates considered and the trade-offs, and § U
+> for the P3.9-D record.
 
 `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` are required only for
 the Docker Compose `postgres` service.
@@ -209,8 +238,17 @@ The worker must be running, or messages are acknowledged and never answered.
 docker compose up --build
 ```
 
-Compose provides `redis`, `postgres`, `api`, and `worker`. Ports bind to
+Compose provides `redis`, `postgres`, `api`, `bot`, and `worker`. Ports bind to
 `127.0.0.1` only.
+
+`api` and `bot` are deliberately separate processes. `api` serves `/health` and
+`/ready`; `bot` owns the Telegram long-polling loop. Running both roles in one
+process works until a second process exists — Telegram delivers each update to
+whichever consumer asks last, so two pollers do not give a redundancy, they give
+messages dropped at random. Exactly one process polls, and `api` runs with
+`TELEGRAM_POLLING=false` to guarantee it. `bot` exposes no port and is
+healthchecked by a heartbeat it writes every 15s (`app/bot/heartbeat.py`); a
+green status means the loop is turning, not that the bot has done any work.
 
 ---
 
@@ -264,12 +302,15 @@ Recorded deliberately, not oversights. The full list, with the reasoning behind
 each trade-off, is in
 [`docs/phases/PHASE-02-AI-CHAT.md`](docs/phases/PHASE-02-AI-CHAT.md) § 14.
 
-**Not verified in the environment Phase 2 was completed in:** Telegram message
-delivery (the Telegram API refuses the connection), GitHub Actions execution,
-and `docker build` against the exact pinned base image (Docker Hub is blocked
-here; a build differing only in the `FROM` line succeeded). Everything else,
-including a real end-to-end conversation against the live AI provider, was
-verified.
+**Verified since Phase 2 closed:** GitHub Actions execution (green) and the
+Docker Compose configuration. The image was built and the API, worker, and
+migration containers were run during Phase 2 with only the `FROM` line
+substituted (Docker Hub was unreachable from that environment). **Still not
+verified:** Telegram message delivery — `api.telegram.org` refuses the
+connection from the development environment, so real `sendMessage` calls raised
+`TelegramNetworkError`, which the application contained correctly; the delivery
+logic is covered by substituted-transport tests. Everything else, including a
+real end-to-end conversation against the live AI provider, was verified.
 
 - **Rate limiting and the daily allowance are in-process.** With more than one
   API process the counters stop being global. A shared store is required before
@@ -302,7 +343,8 @@ verified.
   replacing it.
 - **The Celery task is still named `process_research`.** Inherited from Phase 1
   under the no-rename rule (`AD-027`).
-- **Credentials still require manual rotation.** See below.
+- **Credential rotation is complete.** The Phase 1 exposure was rotated before
+  Phase 2; see "Credential exposure — resolved" below.
 
 ---
 
@@ -314,18 +356,17 @@ verified.
 - Full user message text is never logged; only length and a short prefix.
 - `.env` is git-ignored. `.env.example` contains placeholders only.
 
-### Outstanding manual action
+### Credential exposure — resolved
 
-> **This is now a live exposure, not a theoretical one.** The provider key in
-> `.env` was confirmed working against the live API during Phase 2 completion
-> (HTTP 200 on `/models`). It sits in this repository's git history, where a
-> previously hardcoded OpenRouter-format key also remains. Rotate both.
+Three credentials were exposed before this repository was initialised with git:
+the Telegram bot token and the AI provider key in `.env`, plus a previously
+hardcoded OpenRouter-format key that sat in plaintext in source. **All three
+were rotated/revoked by a human before Phase 2** (Phase 1 items P0-3/SR-4).
 
-Two credentials were previously exposed and **must be rotated by a human**:
-
-1. **Telegram bot token** — @BotFather → `/token` → revoke, then update `.env`.
-2. **AI provider key** — revoke in the provider dashboard, then update `.env`.
-3. **A previously hardcoded OpenRouter-format key** — revoke in the OpenRouter
-   account. It sat in plaintext in source and may still be live.
-
-Rotation requires provider dashboard access and cannot be automated.
+A full scan of every commit confirms **no secret-shaped value exists anywhere
+in this repository's git history**: `.env` was never committed, and the first
+commit already contains the Phase 1 structure, so the pre-Phase-1 code that
+held the hardcoded key never entered version control. The exposure predates git
+and no committed secret remains to revoke. An earlier revision of this section
+claimed the keys were recoverable from git history; that claim was checked
+against the actual history and corrected here.

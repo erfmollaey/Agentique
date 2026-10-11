@@ -86,6 +86,25 @@ class Settings(BaseSettings):
     # oversized message cannot reach the provider or the database.
     CHAT_MAX_MESSAGE_CHARS: int = Field(default=4000, gt=0)
 
+    # --- Telegram polling ---------------------------------------------------
+    # Whether the ASGI process also runs the long poller.
+    #
+    # True by default, so a single-process deployment behaves exactly as it always
+    # has: `uvicorn app.main:app` serves HTTP and polls. The compose stack sets it
+    # false on `api` and true on the dedicated `bot` service, because two processes
+    # calling getUpdates on one bot token is not a redundancy — Telegram delivers
+    # each update to whichever consumer asks last, so messages are dropped at
+    # random and the failure looks like a flaky bot rather than a duplicated one.
+    #
+    # Keep the default True. A deployment that only wants the HTTP surface is a
+    # deliberate choice, not the absence of one.
+    TELEGRAM_POLLING: bool = True
+    # Where the standalone poller writes its heartbeat, and how often.
+    # Only used by `python -m app.bot.poller`; the ASGI poller has no worker
+    # process to prove anything to.
+    BOT_HEARTBEAT_PATH: str = "/tmp/agentique-bot-heartbeat"
+    BOT_HEARTBEAT_INTERVAL_SECONDS: float = Field(default=15.0, gt=0)
+
     # --- Celery (H-3, M-9, P0-13, P1-9) ------------------------------------
     REDIS_URL: str
     # Hard ceiling on one task. 120 s was measured to be **below** the pipeline's

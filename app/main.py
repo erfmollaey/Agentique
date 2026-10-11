@@ -72,7 +72,14 @@ async def lifespan(app: FastAPI):
     register_handlers(container.dispatcher, container)
     app.state.container = container
 
-    _poller_task = asyncio.create_task(_poll(container), name="telegram-poller")
+    # Polling is opt-out, not opt-in: the default deployment is one process that
+    # both serves and polls. The compose split runs this process with
+    # TELEGRAM_POLLING=false and a separate `bot` service that polls, so the two
+    # never compete for getUpdates.
+    if SETTINGS.TELEGRAM_POLLING:
+        _poller_task = asyncio.create_task(_poll(container), name="telegram-poller")
+    else:
+        log.info("telegram polling disabled for this process (TELEGRAM_POLLING)")
     log.info("application started (environment=%s)", SETTINGS.ENVIRONMENT)
 
     try:

@@ -70,6 +70,12 @@ services:
 
   api:
     <<: *app
+    # TELEGRAM_POLLING=false: this process serves HTTP only. The `bot` service
+    # owns the update stream. Both polling would not be a redundancy — Telegram
+    # delivers each update to whichever consumer asks last, so messages would be
+    # dropped at random and the failure would look like a flaky bot.
+    environment:
+      TELEGRAM_POLLING: "false"
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
@@ -84,6 +90,41 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+  bot:
+    <<: *app
+    # The Telegram long poller. Same image, different command — no second
+    # build, no second dependency set, and the two roles stay in lockstep.
+    #
+    # Shares nothing with `api`, including the bot token's getUpdates consumer:
+    # exactly one process polls, which is the whole point of splitting them.
+    command: >
+      python -m app.bot.poller
+    # No ports: this process serves no HTTP surface, so exposing one would imply
+    # an API that does not exist.
+    expose:
+      - "8000"
+    depends_on:
+      # The broker and the database, because the intake path writes the run row
+      # before the task is ever enqueued. Redis and Postgres are equal-order
+      # peers, not workers.
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The poller writes a heartbeat every BOT_HEARTBEAT_INTERVAL_SECONDS.
+      # A module rather than a shell one-liner so the staleness rule lives beside
+      # the writer and cannot drift from it. See app/bot/heartbeat.py for what
+      # this does and does not prove.
+      test: ["CMD", "python", "-m", "app.bot.heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Generous, deliberately: the first tick requires a working container, a
+      # migrated database, and a successful Telegram getMe — any of which is
+      # slower than the loop.
+      start_period: 45s
 
   worker:
     <<: *app
