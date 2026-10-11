@@ -219,11 +219,24 @@ class Settings(BaseSettings):
     # or says so here; there is no "try both", because a resolver that silently
     # disagrees with itself is worse than one that fails.
     FETCH_DNS_MODE: str = "system"
-    # The RFC 8484 endpoint used when FETCH_DNS_MODE=doh. Any DoH provider works;
-    # the wire format is the standard one, so this is not a vendor API.
-    FETCH_DOH_ENDPOINT: str = "https://cloudflare-dns.com/dns-query"
-    # Bound on one DNS-over-HTTPS round trip. The fetch timeout is not reused on
-    # purpose: a resolver that hangs must not consume a fetch's whole budget.
+    # The RFC 8484 endpoints used when FETCH_DNS_MODE=doh, in the order they are
+    # tried. Comma-separated. Each is tried in turn only when the one before it
+    # could not be *reached or understood* — a transport failure, a non-200, or a
+    # malformed answer. An endpoint that answers is used as-is, even when it
+    # answers "no records": a legitimate NXDOMAIN must not be masked by asking a
+    # different provider, because which provider answered is then not something
+    # the deployment can reason about.
+    #
+    # Any DoH provider works; the wire format is the standard one, so this is not
+    # a vendor API. The default lists two independent operators on purpose — a
+    # single endpoint is a single point of failure for the whole fetch stage —
+    # and a deployment should point this at a resolver it trusts or runs.
+    FETCH_DNS_SERVERS: str = (
+        "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
+    )
+    # Bound on one DNS-over-HTTPS round trip, per attempt. The fetch timeout is
+    # not reused on purpose: a resolver that hangs must not consume a fetch's
+    # whole budget.
     FETCH_DOH_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0)
 
 

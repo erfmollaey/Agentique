@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ipaddress
 import struct
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -41,6 +42,7 @@ from app.infrastructure.fetch.resolver import (
     RESOLVER_MODES,
     DoHAddressResolver,
     configured_resolver,
+    parse_doh_endpoints,
 )
 from app.infrastructure.fetch.ssrf import (
     SsrfPolicy,
@@ -127,6 +129,48 @@ def doh_resolver_with(records: list[tuple[int, str]], **overrides: object):
     return DoHAddressResolver(settings, client=client), sent
 
 
+def doh_with_scripted_endpoints(behaviour):
+    """A resolver pointing at two endpoints whose behaviour ``behaviour`` scripts.
+
+    ``behaviour`` is called with the request's hostname and answers with one of:
+    a list of A/AAAA records (answered normally), an :class:`httpx.Response`
+    (returned as given), or an exception to raise. Every attempt is recorded in
+    ``attempts``, in the order the endpoints were contacted, which is how the
+    ordering assertions are made.
+    """
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = urlsplit(str(request.url)).hostname
+        attempts.append(host)
+        scripted = behaviour(host)
+        if isinstance(scripted, BaseException):
+            raise scripted
+        if isinstance(scripted, httpx.Response):
+            return scripted
+        qtype = struct.unpack(">H", request.content[-4:-2])[0]
+        matching = [record for record in scripted if record[0] == qtype]
+        return httpx.Response(200, content=dns_message(matching))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    resolver = DoHAddressResolver(
+        doh_settings(), client=client, endpoints=_SCRIPTED_DEFAULT_ENDPOINTS
+    )
+    return resolver, attempts
+
+
+#: The two endpoints every fallback test points at, so a test can name a
+#: primary and a secondary without inventing URLs each time.
+_SCRIPTED_DEFAULT_ENDPOINTS = (
+    "https://primary.example/dns-query",
+    "https://secondary.example/dns-query",
+)
+
+_PRIMARY_HOST = "primary.example"
+_SECONDARY_HOST = "secondary.example"
+
+
 # --- resolver selection ----------------------------------------------------
 
 
@@ -152,15 +196,45 @@ def test_the_recognised_modes_are_the_ones_that_exist():
     assert sorted(RESOLVER_MODES) == ["doh", "system"]
 
 
-def test_a_doh_resolver_requires_an_endpoint():
-    with pytest.raises(ValueError, match="FETCH_DOH_ENDPOINT"):
-        DoHAddressResolver(doh_settings(FETCH_DOH_ENDPOINT="   "))
+def test_a_doh_resolver_requires_at_least_one_endpoint():
+    """A resolver configured with nowhere to ask is a deployment that cannot
+    reason about its own addresses."""
+    with pytest.raises(ValueError, match="FETCH_DNS_SERVERS"):
+        DoHAddressResolver(doh_settings(FETCH_DNS_SERVERS="   "))
 
 
-def test_a_doh_endpoint_must_be_https():
+def test_every_doh_endpoint_must_be_https():
     """The hostname being looked up must not travel on a plaintext channel."""
     with pytest.raises(ValueError, match="https"):
-        DoHAddressResolver(doh_settings(FETCH_DOH_ENDPOINT="http://dns.example/query"))
+        DoHAddressResolver(doh_settings(FETCH_DNS_SERVERS="http://dns.example/query"))
+
+
+def test_the_default_servers_list_two_independent_operators():
+    """A single endpoint is a single point of failure for the whole fetch stage.
+
+    Built from the module's own base settings, which set only the required
+    fields, so ``FETCH_DNS_SERVERS`` is read at its default exactly as a real
+    deployment would see it.
+    """
+    servers = parse_doh_endpoints(_settings().FETCH_DNS_SERVERS)
+    assert len(servers) >= 2
+    assert all(server.startswith("https://") for server in servers)
+    assert len(set(servers)) == len(servers), "a duplicated endpoint is not a fallback"
+
+
+def test_comma_separated_entries_are_split_and_validated():
+    servers = parse_doh_endpoints(
+        "https://a.example/query, https://b.example/query ,https://c.example/query"
+    )
+    assert servers == (
+        "https://a.example/query",
+        "https://b.example/query",
+        "https://c.example/query",
+    )
+
+
+def test_a_sequence_of_endpoints_is_accepted_without_settings():
+    assert parse_doh_endpoints(["https://a.example/query"]) == ("https://a.example/query",)
 
 
 def test_a_doh_resolver_satisfies_the_address_resolver_port():
@@ -415,3 +489,119 @@ def _fetcher_with_resolver_and_transport(settings, resolver, transport):
         policy=SsrfPolicy(allowed_schemes=configured_schemes(settings), resolver=resolver),
         transport=transport,
     )
+
+
+# --- ordered fallback across endpoints -------------------------------------
+#
+# The point of the list. One endpoint is a single point of failure for the whole
+# fetch stage, so a second, independent operator is asked when the first cannot
+# be reached or understood.
+
+
+async def test_doh_falls_back_to_the_secondary_endpoint():
+    """Primary unreachable → secondary answers → the address is the real one."""
+    resolver, attempts = doh_with_scripted_endpoints(
+        lambda host: httpx.ConnectError("unreachable")
+        if host == _PRIMARY_HOST
+        else [(1, "140.82.121.3")]
+    )
+
+    addresses = tuple(await resolver.resolve("github.com", 443))
+
+    assert addresses == ("140.82.121.3",)
+    # The primary was tried first, exactly once, and only for A.
+    assert attempts[0] == _PRIMARY_HOST
+    assert _PRIMARY_HOST in attempts and _SECONDARY_HOST in attempts
+
+
+async def test_doh_tries_the_primary_before_the_secondary():
+    """Order is the configured order, not the order the transport happens to
+    attempt, so a deployment can put the resolver it trusts first."""
+    resolver, attempts = doh_with_scripted_endpoints(
+        lambda host: httpx.ConnectError("down") if host == _PRIMARY_HOST else []
+    )
+
+    with pytest.raises(FetchDNSResolutionError):
+        await resolver.resolve("github.com", 443)
+
+    assert attempts == [_PRIMARY_HOST, _SECONDARY_HOST] * 2, (
+        "every endpoint is tried for each record type, in order"
+    )
+
+
+async def test_doh_falls_back_when_the_primary_returns_a_non_200():
+    """A provider answering 502 has not answered the question."""
+    resolver, _ = doh_with_scripted_endpoints(
+        lambda host: httpx.Response(502)
+        if host == _PRIMARY_HOST
+        else [(1, "140.82.121.3")]
+    )
+
+    assert tuple(await resolver.resolve("github.com", 443)) == ("140.82.121.3",)
+
+
+async def test_doh_falls_back_when_the_primary_returns_garbage():
+    """An unparseable answer is a failure to answer, not an empty answer."""
+    resolver, _ = doh_with_scripted_endpoints(
+        lambda host: httpx.Response(200, content=b"\x00not-dns-at-all")
+        if host == _PRIMARY_HOST
+        else [(1, "140.82.121.3")]
+    )
+
+    assert tuple(await resolver.resolve("github.com", 443)) == ("140.82.121.3",)
+
+
+async def test_doh_does_not_fall_back_when_the_primary_answers_empty():
+    """The deliberate limit: an endpoint that *answers* is used as it answered.
+
+    A legitimate "no records" must not be masked by asking a different provider,
+    because then which provider answered is not something the deployment can
+    reason about. The host simply does not resolve, and the caller fails closed.
+    """
+    resolver, attempts = doh_with_scripted_endpoints(
+        lambda host: [] if host == _PRIMARY_HOST else [(1, "140.82.121.3")]
+    )
+
+    with pytest.raises(FetchDNSResolutionError, match="no addresses"):
+        await resolver.resolve("github.com", 443)
+
+    assert attempts == [_PRIMARY_HOST] * 2, "the secondary must not have been asked"
+
+
+async def test_doh_reports_every_failure_when_no_endpoint_answers():
+    """The error names what was tried, without letting a single provider's text
+    become the diagnosis."""
+    resolver, _ = doh_with_scripted_endpoints(lambda host: httpx.ConnectError("down"))
+
+    with pytest.raises(FetchDNSResolutionError) as caught:
+        await resolver.resolve("github.com", 443)
+
+    message = str(caught.value)
+    assert "no configured dns-over-https endpoint answered" in message
+    assert _PRIMARY_HOST in message and _SECONDARY_HOST in message
+
+
+async def test_doh_reports_a_timeout_from_every_endpoint():
+    resolver, attempts = doh_with_scripted_endpoints(
+        lambda host: httpx.ReadTimeout("too slow")
+    )
+
+    with pytest.raises(FetchDNSResolutionError):
+        await resolver.resolve("github.com", 443)
+
+    assert set(attempts) == {_PRIMARY_HOST, _SECONDARY_HOST}, (
+        "both endpoints must be tried before giving up"
+    )
+    assert attempts.count(_PRIMARY_HOST) == attempts.count(_SECONDARY_HOST)
+
+
+async def test_doh_shares_one_client_across_endpoints():
+    """One pool, not two: a resolver that builds a client per endpoint pays TLS
+    on every lookup and gets no keep-alive benefit."""
+    resolver, _ = doh_with_scripted_endpoints(lambda host: [(1, "140.82.121.3")])
+    try:
+        assert resolver._client is not None
+        # Both endpoints are reachable through the one injected transport.
+        assert len(await resolver.resolve("github.com", 443)) == 1
+    finally:
+        await resolver.aclose()

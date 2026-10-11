@@ -10,6 +10,10 @@ still decides that, for both.
     FETCH_DNS_MODE=doh     →  DoHAddressResolver      (DNS over HTTPS, RFC 8484)
 ```
 
+The doh mode takes an ordered list of endpoints (``FETCH_DNS_SERVERS``) and
+falls through it when an endpoint cannot be reached or understood. An endpoint
+that answers — including an answer of "no records" — is used as-is.
+
 Why a second resolver exists at all
 ----------------------------------
 It was measured, not theorised. A developer host with a fake-IP DNS layer —
@@ -38,6 +42,7 @@ from __future__ import annotations
 import ipaddress
 import struct
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -91,32 +96,36 @@ def configured_resolver(settings: Settings) -> SystemAddressResolver | DoHAddres
 
 
 class DoHAddressResolver:
-    """Answers a hostname through a DNS-over-HTTPS endpoint.
+    """Answers a hostname through an ordered list of DNS-over-HTTPS endpoints.
 
     Not a faster resolver and not a more private one by policy — those are
     consequences, not the reason it is here. It exists because some networks
     rewrite UDP/53 answers into non-routable space and nothing in the container
     can see past that. HTTPS answers, on those same networks, are real.
 
-    The endpoint is configured, so a deployment may run its own resolver rather
-    than a public one; the wire format is standard RFC 8484, so any of them
-    works. ``trust_env=False`` matches the rest of the fetch and search
-    boundaries: a proxy variable in the environment must not be able to reroute
-    a resolver the deployment chose deliberately.
+    The endpoints are configured (``FETCH_DNS_SERVERS``), so a deployment may run
+    its own resolver rather than a public one; the wire format is standard
+    RFC 8484, so any of them works. They are tried **in order**, and each is tried
+    only when the one before it could not be reached or understood. One client is
+    shared between them, because a resolver that opens a connection per query is
+    a resolver that pays TLS on every lookup, and a separate client per endpoint
+    would be two pools where one is enough.
+
+    ``trust_env=False`` matches the rest of the fetch and search boundaries: a
+    proxy variable in the environment must not be able to reroute a resolver the
+    deployment chose deliberately.
     """
 
     def __init__(
-        self, settings: Settings, client: httpx.AsyncClient | None = None
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient | None = None,
+        endpoints: Sequence[str] | None = None,
     ) -> None:
         self._settings = settings
-        endpoint = (settings.FETCH_DOH_ENDPOINT or "").strip()
-        if not endpoint:
-            raise ValueError("FETCH_DOH_ENDPOINT must be set when FETCH_DNS_MODE=doh")
-        if httpx.URL(endpoint).scheme != "https":
-            # A plaintext or scheme-less endpoint would put the hostname being
-            # looked up on an unnecessary channel.
-            raise ValueError("FETCH_DOH_ENDPOINT must be an https:// URL")
-        self._endpoint = endpoint
+        self._endpoints = parse_doh_endpoints(
+            endpoints if endpoints is not None else settings.FETCH_DNS_SERVERS
+        )
         self._client = client or httpx.AsyncClient(
             timeout=settings.FETCH_DOH_TIMEOUT_SECONDS,
             trust_env=False,
@@ -156,10 +165,30 @@ class DoHAddressResolver:
         The question travels in the body, not the URL. A URL is the one string
         that reaches a log line verbatim, and a hostname in a query parameter
         would be metadata this pipeline has no business writing down (SR-7).
+
+        Endpoints are tried in configured order. An endpoint that *answers* is
+        used as it answered, including an answer of "no records" — that is a
+        legitimate response, not a failure, and asking a second provider would
+        make which provider answered a thing the deployment cannot reason about.
+        Only an endpoint that could not be reached, or whose answer could not be
+        parsed, moves the list on.
         """
+        failures: list[str] = []
+        for endpoint in self._endpoints:
+            try:
+                return await self._post(endpoint, hostname, qtype)
+            except FetchDNSResolutionError as exc:
+                failures.append(f"{urlsplit(endpoint).hostname}: {exc}")
+        raise FetchDNSResolutionError(
+            "no configured dns-over-https endpoint answered "
+            f"({'; '.join(failures)})"
+        )
+
+    async def _post(self, endpoint: str, hostname: str, qtype: int) -> tuple[str, ...]:
+        """One POST to one endpoint, with every failure mapped to one type."""
         try:
             response = await self._client.post(
-                self._endpoint,
+                endpoint,
                 content=_encode_query(hostname, qtype),
                 headers={
                     "content-type": "application/dns-message",
@@ -188,6 +217,34 @@ class DoHAddressResolver:
         """
         if self._owns_client:
             await self._client.aclose()
+
+
+def parse_doh_endpoints(configured: str | Sequence[str]) -> tuple[str, ...]:
+    """The configured DoH endpoints, or :class:`ValueError` if unusable.
+
+    Accepts a comma-separated string or an already-split sequence, so a test can
+    hand over a list without building a settings object. Every entry must be
+    absolute HTTPS: a plaintext or scheme-less endpoint would put the hostname
+    being looked up on an unnecessary channel. An empty result is refused rather
+    than defaulted, because a resolver configured with nowhere to ask and a
+    default fallback is a deployment that cannot reason about its own addresses.
+    """
+    if isinstance(configured, str):
+        candidates = [part.strip() for part in configured.split(",")]
+    else:
+        candidates = [str(part).strip() for part in configured]
+
+    endpoints: list[str] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if httpx.URL(candidate).scheme != "https":
+            raise ValueError(f"every DoH endpoint must be an https:// URL: {candidate!r}")
+        endpoints.append(candidate)
+
+    if not endpoints:
+        raise ValueError("FETCH_DNS_SERVERS must list at least one https:// endpoint")
+    return tuple(endpoints)
 
 
 # --- RFC 8484 wire format -------------------------------------------------
