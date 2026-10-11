@@ -97,7 +97,24 @@ services:
       --pool=prefork
     healthcheck:
       # Celery exposes a ping; disabled by default in the worker.
-      test: ["CMD", "celery", "-A", "app.core.celery_app:celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      #
+      # CMD-SHELL, not CMD, and that is load-bearing. The destination is
+      # ``celery@$HOSTNAME``, and a shell is what expands ``$HOSTNAME`` — Docker
+      # sets it in the container environment, and the worker's node name matches
+      # it. With exec-form ["CMD", ...] no shell runs, so the argument arrives as
+      # the literal string ``celery@$HOSTNAME``, no node answers it, and celery
+      # exits 69 "No nodes replied" on every check. That is exactly what this
+      # service reported for 77 consecutive runs: the worker was healthy and
+      # answering, and the probe was asking a name that could not exist.
+      #
+      # ``$$HOSTNAME`` rather than ``$HOSTNAME`` is compose's escape, so the
+      # variable reaches the shell at container run time instead of being
+      # substituted (or failing) when the file is parsed.
+      #
+      # The bound is a real one: without it the probe waits on celery's default
+      # and a wedged worker holds the healthcheck open until the Docker timeout
+      # kills it, which is a worse signal than a clean failure.
+      test: ["CMD-SHELL", "celery -A app.core.celery_app:celery_app inspect ping --timeout 5 -d celery@$$HOSTNAME"]
       interval: 30s
       timeout: 10s
       retries: 3
