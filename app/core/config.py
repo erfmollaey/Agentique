@@ -88,8 +88,34 @@ class Settings(BaseSettings):
 
     # --- Celery (H-3, M-9, P0-13, P1-9) ------------------------------------
     REDIS_URL: str
-    CELERY_TASK_TIME_LIMIT: int = Field(default=120, gt=0)
-    CELERY_TASK_SOFT_TIME_LIMIT: int = Field(default=100, gt=0)
+    # Hard ceiling on one task. 120 s was measured to be **below** the pipeline's
+    # real duration: a fully-successful 5-source run took 426 s claim-to-terminal
+    # with DoH resolution, and a harder question was SIGKILLed at 120 s
+    # mid-evidence, which is the failure that exposed the gap. The evidence stage
+    # alone makes 1 + CLAIM_MAX_WINDOWS model calls per source, so the run is
+    # tens of provider calls, not one.
+    #
+    # 900 s ≈ 2.1× the measured worst observed run, which leaves room for the
+    # retry backoff the provider rate limit actually produces (a run that stalls
+    # on 429s and retries adds minutes, not seconds). The worst-case *budget* is
+    # far larger than the typical case — 27 provider calls at a 60 s timeout
+    # each — so this remains a backstop, not a target. Tune it from a measured
+    # run of your own, not from this default.
+    #
+    # Raising it is what makes the soft limit below meaningful: with a hard limit
+    # under the pipeline's duration, the hard limit fires first, the worker is
+    # SIGKILLed, no graceful handling runs at all, and the run is left `running`
+    # for the next redelivery to trip over.
+    CELERY_TASK_TIME_LIMIT: int = Field(default=900, gt=0)
+    # Soft ceiling, strictly below the hard one. Crossing it raises
+    # SoftTimeLimitExceeded *inside* the awaiting frame, which is the only signal
+    # the task can act on: the run is marked failed, one terminal notice is sent,
+    # and no retry re-spends the budget. The 120 s margin is the shutdown
+    # allowance — enough to write one status transition and send one message.
+    #
+    # Must stay below CELERY_TASK_TIME_LIMIT or it does nothing; a validator
+    # below enforces it at construction rather than at the moment it is needed.
+    CELERY_TASK_SOFT_TIME_LIMIT: int = Field(default=780, gt=0)
     CELERY_TASK_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
     CELERY_TASK_RETRY_BACKOFF: int = Field(default=5, ge=0)
     CELERY_WORKER_PREFETCH_MULTIPLIER: int = Field(default=1, ge=1)
