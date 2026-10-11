@@ -7,8 +7,11 @@
 >
 > Phase 1 — Core Infrastructure & Stabilization has since resolved the findings
 > recorded here: C-1, C-2, C-3, C-4, H-1 through H-7, M-5 through M-10, and S-2.
-> Two remain partial (H-8 containerisation, and the CI tail of SR-10) and one is
-> blocked on a manual human action (credential rotation, P0-3 / SR-4).
+> Two remained partial (H-8 containerisation, and the CI tail of SR-10) and one
+> was blocked on a manual human action (credential rotation, P0-3 / SR-4).
+> **All three were subsequently resolved** — rotation completed before Phase 2,
+> Docker and CI verified green (reconciled 2026-10-07; see the Phase 3 P3.0
+> note below and Phase 1 § 14).
 >
 > Everything below is retained **verbatim as the defect baseline**. Its line
 > numbers, findings, and severity judgements describe the pre-Phase-1 code and
@@ -72,6 +75,248 @@
 > Two defects found in this pass are recorded in the Phase 2 document, not here:
 > every secret scanner in the repository was blind to Groq's `gsk_` key format
 > (`P2-7`), and the configured model had been retired by the provider (`P2-8`).
+>
+> ### Update — 2026-10-07, Phase 3 P3.0 contract freeze
+>
+> Phases 1 and 2 are complete and closed (credential rotation, CI, and Docker
+> verification reconciled; Phase 1 § 14 and Phase 2 § 14 carry the notes).
+> Phase 3 is active. P3.0 froze the Research Engine's architectural contract
+> **without writing production code** — nothing below is implemented; each
+> entry is a frozen decision an implementation stage must satisfy. Full
+> contract: [`phases/PHASE-03-RESEARCH-ENGINE.md`](./phases/PHASE-03-RESEARCH-ENGINE.md)
+> § 15; decisions AD-029 … AD-035 in [`PROJECT_PLAN.md`](./PROJECT_PLAN.md).
+>
+> - **Port-based Research Engine.** Domain/application logic will depend on
+>   ports (search provider, safe fetcher, content extractor, ranking policy,
+>   research repositories) with concrete adapters in `app/infrastructure/` —
+>   the same philosophy as the Phase 2 `LLMProvider`. The search provider
+>   stays deliberately unselected (AD-006, gates P3.2).
+> - **SSRF fetch boundary.** A dedicated restricted fetch client: DNS
+>   resolution with every resolved address validated against
+>   private/loopback/link-local/reserved ranges before connecting; the
+>   connection uses the validated resolution (DNS-rebinding closure);
+>   revalidation at every redirect hop; HTTP(S) only; timeout, streaming
+>   size, decompression, and redirect limits. A security boundary, not an
+>   optimization.
+> - **Untrusted-content boundary.** Fetched web content is data, never
+>   instructions: no tool surface for the research model, delimited
+>   untrusted prompt regions, structurally validated model outputs, and
+>   pipeline-assigned source identity. Prompt-injection defense is
+>   architectural.
+> - **Citation trust chain.** `source → source_chunk → claim → citation`,
+>   every link a persisted row, verified programmatically (FK registry plus
+>   passage verification) — never model self-report.
+> - **Phase 3 persistence model.** Five tables: `research_runs`, `sources`,
+>   `source_chunks`, `claims`, `citations`. The `/delete_account` cascade
+>   must extend across them. Phase 5 workspace persistence remains out of
+>   scope.
+> - **Trigger contract.** `/research <question>`; chat behavior unchanged.
+> - **Recorded execution risk.** The 120-second Celery task limit is sized
+>   for one chat call, not a research run; the deadline/cancellation model
+>   is assigned to the execution stage (P3.9) and was deliberately not
+>   changed at P3.0.
+>
+> ### Update — 2026-10-07, Phase 3 P3.1 persistence foundation
+>
+> P3.1 implemented the Phase 3 persistence foundation and nothing else:
+>
+> - **Domain:** `app/domain/research/` — pure pydantic types (`ResearchRun`,
+>   `Source`, `SourceChunk`, `Claim`, `Citation`) with the frozen status
+>   enums, plus runtime-checkable repository ports. No provider ports yet;
+>   each arrives with the stage that needs it (§ 15.3).
+> - **Ports/UoW:** `app/domain/ports.py` `UnitOfWork` now exposes the five
+>   research repositories alongside the Phase 2 ones.
+> - **Persistence:** `app/db/models.py` adds the five ORM models;
+>   `app/repositories/research.py` implements the ports with SQLAlchemy in
+>   the same style as Phase 2 (ownership scoping via `get_for_user`).
+> - **Schema:** migration `0002_research` (down_revision `0001_phase2`, with
+>   full downgrade) creates the five tables with CHECK constraints on the
+>   frozen status sets, uniqueness (`sources(run_id,url)`,
+>   `source_chunks(source_id,ordinal)`, `citations(claim_id,source_id,chunk_id)`),
+>   FK `ON DELETE CASCADE` everywhere, `SET NULL` on
+>   `research_runs.conversation_id` / `sources.duplicate_of_id`, and indexes
+>   on the retrieval paths. `alembic check` is clean.
+> - **Deletion cascade (AD-034):** `/delete_account` now removes the user's
+>   entire research subtree in the same single cascade delete as the Phase 2
+>   tree; verified against real PostgreSQL including transactional rollback
+>   and cross-user isolation.
+> - **Citation integrity at schema level:** FKs make a citation to
+>   never-persisted evidence uninsertable; programmatic passage verification
+>   remains a later-stage concern (AD-033).
+> - **Status:** 406 tests green, ruff/mypy clean, `alembic check` clean.
+>   Still not implemented: search, fetch (SSRF), extraction, ranking,
+>   planning, synthesis, citations validation, `/research` handler, the
+>   Celery research task. Next stage: P3.2 (search port + provider
+>   selection, AD-006 gate) — see the P3.2 update below.
+>
+> ### Update — 2026-10-08, after Phase 3 P3.7 (per-source summarization + evidence-grounded claims)
+>
+> The P3.6 note below is extended, not corrected. P3.7 added the stage that turns one
+> source's persisted passages into a summary and a set of claims, and changed no prior
+> decision.
+>
+> - **Claims are born with evidence, and that is structural, not procedural.**
+>   `ClaimExtractor.extract()` returns `ClaimCandidate` values — unverified model output.
+>   The *application layer* calls `verify_claims()`, and it is the only thing in the
+>   system that can produce a `VerifiedClaim`. Accepting a claim is therefore not in any
+>   adapter's signature, and no adapter — the part of this stage closest to untrusted web
+>   text — has the authority to grant it (AD-039).
+> - **A claim is accepted only on a substring, never on similarity.** The quoted passage
+>   must be present in the stored `source_chunks.text` after an explicitly minimal
+>   normalization (NFC + whitespace collapse). No embedding, no fuzzy matching, no second
+>   model adjudicating the first. The model is never asked to verify itself, and
+>   `claims.confidence` is deliberately left `NULL` because nothing here measures it.
+> - **A passage reference is resolved only against the current source's passages.** A
+>   chunk id belonging to another source is rejected exactly as one that does not exist;
+>   the database is never consulted to classify a fabricated id (AD-039).
+> - **Retrieved content enters prompts for the first time, as untrusted data.** Both
+>   system-prompt builders take *numbers only* — passage count, claim ceiling — so no
+>   parameter exists through which a title, a domain, or a character of fetched text could
+>   reach the instructions. Content and metadata travel in the user role inside delimiters
+>   the system prompt declares to be quotable evidence. The adapter has **no tool
+>   surface**: the Phase 2 `LLMProvider` port has no tool slot, and the adapter imports no
+>   HTTP client, SDK, browser, or database driver (asserted structurally, AD-032).
+> - **The passage quote is persisted, and ownership is a database constraint.**
+>   `citations.quote` is `NOT NULL`, and `citations (chunk_id, source_id) →
+>   source_chunks (id, source_id)` makes a cross-source citation uninsertable. The
+>   textual containment rule cannot be expressed in SQL — it compares one row's text
+>   against another's — so it is enforced immediately before persistence and asserted
+>   against the stored rows. **No table was added**; the five-table model of AD-034 is
+>   unchanged (AD-038, migration `0003_research_evidence`).
+> - **A summary is not evidence.** `sources.summary` is a text column with no relation to
+>   `citations`, so it cannot be cited. Coverage is bounded and *reported*
+>   (`summary_truncated`, `claim_truncated`) rather than silently truncated.
+> - **Status:** 322 new tests; `ruff` and `mypy` clean on every P3.7 file; `alembic check`
+>   clean. **Full suite: 1492 passed, 21 failed** — all pre-existing and unrelated
+>   (P3.3 `_embedded_ipv6` and `FetchHTTPStatusError` defects, a P3.4 dependency-declaration
+>   debt, and one environment-dependent P3.3 DNS test). **Live-provider quality is NOT
+>   VERIFIED.** Full record:
+>   [`audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](./audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md)
+>   § P. Next stage: **P3.8 — Synthesis + citation construction.**
+>
+> ### Update — 2026-10-08, after Phase 3 P3.6 (research planning)
+>
+> The P3.5 note below is extended, not corrected. P3.6 added the stage before
+> search and changed no prior decision.
+>
+> - **Planning is a validated intermediate representation.** `ResearchPlan`
+>   (`app/domain/research/planning.py`) carries what FR-1 names — an objective,
+>   steps, and per step a sub-question, a search query, and expected source types —
+>   as typed fields, never as an untyped blob. A plan *describes* research; it does
+>   not perform it, and it is not evidence.
+> - **Non-degeneracy is enforced (FR-3).** Empty objective, no steps, **or no
+>   search step** is rejected at construction. A run whose plan legitimately finds
+>   nothing is a later stage's outcome (FR-41); a run with no plan is a defect, and
+>   the two are deliberately not conflated.
+> - **The dependency graph is validated, not assumed.** Unknown references,
+>   self-dependencies, and cycles each raise a distinct typed error, checked with an
+>   iterative Kahn's algorithm — no graph library, because the project declares none
+>   and the requirement is one reachability question over a handful of nodes.
+> - **Phase 2's `LLMProvider` is reused unchanged.** The planner is a
+>   `PlanningProvider` adapter that calls the existing port; there is no second
+>   provider abstraction, no new client, and no SDK import in the planner. Its
+>   existing bounded retry and model fallback chain are reused, so the planner adds
+>   no retry of its own.
+> - **AD-026 resolved — Option B.** A dedicated Phase 3 planner supersedes
+>   `Supervisor.analyze_query` for planning; `Supervisor` is retained unchanged.
+>   `QueryAnalysis` cannot express FR-1's search strategies or expected source
+>   types, and widening a Phase 2 schema the chat path depends on would couple two
+>   unrelated paths. Recorded as `AD-037`; evidence in the audit § O.10.
+> - **The planner has no tools, so model output cannot cause an action** (AD-032).
+>   The question reaches the model only as delimited user-role data, and the system
+>   prompt is a constant taking only a step count — the Phase 2 parameterless-builder
+>   invariant, kept. This is stage containment, not full injection immunity; the
+>   stronger boundary for retrieved web content belongs to P3.8.
+> - **Persisted on the existing column.** `research_runs.plan` (JSONB) already
+>   existed from P3.1 and was reused; the round-trip is lossless and re-validating,
+>   verified against real PostgreSQL. **No migration, no new dependency.**
+> - **Status:** 204 new tests; `ruff` and `mypy` clean on every P3.6 file.
+>   **Live-provider quality is NOT VERIFIED** — planning was tested against a fake
+>   provider only. Full record:
+>   [`audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](./audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md)
+>   § O. Next stage: **P3.7 — Summarization + claim extraction.**
+>
+> ### Update — 2026-10-08, after Phase 3 P3.5 (deduplication + ranking)
+>
+> The P3.2 note below is extended, not corrected. P3.5 added the stage between
+> extraction and synthesis, and nothing here disturbs the SSRF boundary.
+>
+> - **Deterministic processing layer, two ports.** `SourceDeduplication` and
+>   `RankingPolicy` are `runtime_checkable` `Protocol`s in
+>   `app/domain/research/ports.py`, so the strategy is replaceable (FR-29). One
+>   stateless, I/O-free adapter in `app/infrastructure/ranking/` implements both;
+>   all the logic lives in `app/domain/research/dedup.py`.
+> - **Canonicalization is not validation.** `canonical_url` compares two values.
+>   It opens no socket, resolves nothing, and approves nothing for retrieval — the
+>   § 15.3 boundary remains P3.3. This is stated explicitly because it is the most
+>   natural place for a second, weaker SSRF boundary to grow.
+> - **Tracking parameters are an explicit, reviewable set**, not a heuristic.
+>   Anything outside it is preserved, because removing a parameter can change what
+>   a URL points at.
+> - **Identity is canonical URL ∪ exact content fingerprint.** Fingerprints are
+>   taken over P3.4's *extracted main content*, which is what keeps two distinct
+>   articles that share a nav menu from collapsing (FR-25). Union-find makes the
+>   two rules one equivalence. No embeddings, no vectors, no LLM.
+> - **Ranking reads no clock.** Freshness is scored against a caller-supplied
+>   `reference_time`, so ranking a stored candidate set reproduces its original
+>   order. The weights are named constants with documented rationale; only the
+>   quality threshold is configurable.
+> - **Exclusion is recorded, never silent.** A source below the threshold keeps
+>   its entry and carries an `excluded_reason`, because a stage that dropped rows
+>   could not report how many it saw (FR-42).
+> - **Status:** 179 new tests; `ruff` and `mypy` clean on every P3.5 file. No
+>   migration, no new dependency, no schema change. **Known limitation: content
+>   identity is exact only** — an edited syndicated copy is not detected.
+>   Full record: [`audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](./audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md)
+>   § N. Next stage: **P3.6 — Planning.**
+>
+> ### Update — 2026-10-07, after Phase 3 P3.2 (search port + provider selection)
+>
+> **Search exists as a contract and one adapter; the pipeline still does not
+> exist.** The P3.1 note above is extended, not corrected.
+>
+> - **SearchPort is provider-independent:** `app/domain/research/ports.py`
+>   declares `SearchProvider`, a `runtime_checkable` `Protocol` with one method,
+>   `async search(SearchRequest) -> SearchResponse`. The types live in
+>   `app/domain/research/search.py` — `SearchRequest` (query, bounded result
+>   count, optional language/market, optional relative freshness window,
+>   optional safe-search level), `SearchResult` (`url`, `domain`, `rank`,
+>   `title`, `snippet`, `published_at`, `relevance`), `SearchResponse`, and
+>   `domain_of()`, the single normalization rule.
+> - **Exactly one concrete adapter exists:**
+>   `app/infrastructure/search/brave.py` (`BraveSearchAdapter`), selected by
+>   `app/infrastructure/search/factory.py::create_search_provider` from
+>   `SEARCH_PROVIDER`. The provider's endpoint, auth-header name, freshness
+>   codes, safe-search codes and result ceiling appear in no other file.
+> - **Provider-specific concerns stay inside the adapter:** credential as a
+>   per-request header (never a URL, never a client default), `trust_env=False`,
+>   `follow_redirects=False`, explicit per-call timeout, status→typed-error
+>   mapping via the `SearchError` family in `app/domain/errors.py`, and logging
+>   of outcome and counts only — never the credential, the query, or a body.
+> - **Replacement is still possible without touching research logic:** a new
+>   adapter module plus one branch in the factory. No domain, persistence, or
+>   stage code changes; a fake `SearchProvider` satisfying a consumer unchanged
+>   is asserted in the suite (T-3).
+> - **A search result is not evidence.** `SearchResult` ≠ `Source` ≠
+>   `SourceChunk`: a result is a URL and a provider-written snippet for a page
+>   nobody in this process has read, and a `Source` is born `PENDING`. Returned
+>   URLs are untrusted and unvalidated here — SSRF protection, redirect
+>   validation, content-type and size limits are P3.3's boundary (AD-031), and
+>   duplicating part of it in the adapter would create a second, weaker one.
+> - **Provider selected:** Brave Search API — `AD-036`, superseding `AD-006`.
+>   Eight candidates were evaluated with live reachability/error probes and
+>   vendor documentation. **Result quality (relevance, diversity, Persian
+>   coverage) was NOT measured:** no usable search credential existed in the
+>   selection environment, and nothing was estimated in its place. Evidence and
+>   trade-offs: [`audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](./audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md)
+>   § K.
+> - **Status:** 512 tests green (106 new, all transport-mocked; no test calls a
+>   real provider), ruff clean, mypy clean, `httpx` promoted from a transitive
+>   pin to an explicit one at the version already resolved. No migration was
+>   created or altered. Still not implemented: fetch (SSRF), extraction,
+>   cleaning, ranking, dedup, planning, synthesis, citations, the research
+>   orchestrator, the Celery research task, the `/research` handler, any research
+>   LLM call. Next stage: **P3.3 — Fetcher + SSRF Security Boundary.**
 
 **Audit type:** READ-ONLY technical audit
 **Repository:** `/Users/erfmollaey/projects/telegram-research-bot`
@@ -801,7 +1046,303 @@ The graph's own clustering confirms the architecture is two disconnected islands
 
 ---
 
+### Update — 2026-10-07, after Phase 3 P3.3 (Fetcher + SSRF Security Boundary)
+* Phase 3 completed the SSRF boundary for untrusted URL fetching. The implementation provides a provider-independent fetch port (`SafeFetcher`) with a security boundary that:
+    * Resolves hostname and validates every returned IPv4/IPv6 address against explicit blocklists (RFC1918, loopback, link-local, multicast, reserved, documentation ranges in both families)
+    * Prevents DNS rebinding by connecting to the validated IP address literal while preserving hostname for Host header and TLS SNI
+    * Re-validates after every redirect hop, rejecting any hop that fails the SSRF policy
+    * Enforces response size limits on the decoded stream (not Content-Length) with compression ratio protection
+    * Uses explicit connect/read/total timeouts
+    * Validates content-type and content-encoding against an allowlist
+    * Provides a typed error taxonomy where SSRF violations are never retryable
+    * Never leaks provider credentials or authorization headers to fetched destinations
+* The actual network connection is handled by `_PinnedTransport` which pins the connect target to the validated IP address, eliminating the DNS-rebinding TOCTOU window
+* All provider-independent contracts live in `app/domain/research/`: `FetchRequest` and `FetchedSource` (raw bytes + metadata, no extraction or text decoding)
+
+---
+
 *End of audit. This document was produced under read-only constraints: no files in the application were modified, created, or deleted; no packages were installed; no migrations were run; no configuration or environment variables were changed; no commits were made. The only filesystem change is the creation of this `docs/` directory and this file.*
+
+---
+
+## Update — 2026-10-07 (Phase 3 P3.4 — Extraction + Persian Fixtures)
+
+P3.4 completed: extraction domain (`app/domain/research/extraction.py` — `ExtractedContent`, `ExtractionStatus`, `ContentExtraction` protocol, typed error family), infrastructure adapter (`app/infrastructure/extract/` — `TrafilaturaExtractor` with ZWNJ-preserving extraction, NFC normalization, content-type dispatch, fixture coverage for English/Persian/mixed/adversarial), config (`EXTRACT_*` settings), tests (`tests/test_research_extraction.py` — 21 passed). No P3.5+ functionality added. No new migration.
+
+---
+
+## Update — 2026-10-08 (Phase 3 P3.8 — Synthesis + Citations)
+
+P3.8 complete. Six new modules and one migration; the five-table research schema is
+unchanged.
+
+**Domain** — `app/domain/research/synthesis.py` holds the whole contract:
+`CitationEntry` (one persisted citation resolved through its chain), `CitationRegistry`
+(the authority for what a citation means, scoped by `claims.run_id`),
+`SynthesisContext`/`plan_synthesis_context` (the deterministic evidence budget),
+`SynthesisInput`, `SynthesisProposal` (the model's output), `VerifiedCitation` /
+`VerifiedSection` / `VerifiedContradiction` / `SynthesizedAnswer` (the trusted result),
+and `verify_synthesis` — the only path from a proposal to an answer.
+
+**Trust boundary.** The model proposes citation *identifiers*; it never establishes that
+one is valid. The proposal schema is closed and carries no `url`, `quote`, `source`,
+`confidence`, or `verified` field at either level, and unknown keys are refused. Every
+field of every trusted citation is copied from a `CitationEntry` the repository built
+from persisted rows. `SynthesizedAnswer` and the three trusted value types are
+constructible only through `verify_synthesis` (a module-private token guard that closes
+`Model(...)` and `model_validate(...)`), and `SynthesizedAnswer.from_payload` re-verifies
+a stored answer against the registry, so a hand-edited `research_runs.synthesis` row
+cannot be read back as a trustworthy answer. Any unresolvable reference refuses the whole
+answer rather than being stripped — AD-041, a deliberate narrowing of § 15.7.
+
+**Contradictions are preserved, never reconciled.** A model-reported conflict keeps both
+sides with all their citations. `claims.status='contradicted'` is deliberately unused:
+marking a losing side *is* silent reconciliation (FR-34).
+
+**Ports and adapters** — `SynthesisProvider` (runtime-checkable, one method) with one
+adapter, `LLMSynthesizer`, over Phase 2's existing `LLMProvider`. No second LLM client,
+no SDK import, no retry, no tool surface. The prompt
+(`app/infrastructure/synthesis/prompts.py`, `cross-source-synthesis-v1`) takes only
+three numbers in its system message; untrusted evidence is the user-role message inside
+`<<<RESEARCH_EVIDENCE>>>` delimiters, and **no source URL is placed in the prompt** —
+the URL reaches the answer from the `sources` row in the application.
+
+**Application** — `SynthesisService.synthesize_run` owns the ordering: read the run
+(ownership first), read the citation registry, bound the evidence, call the provider,
+verify, then persist. It holds no session across the model call and holds no fetcher,
+searcher, or browser.
+
+**Persistence** — `research_runs.synthesis` (JSONB, nullable) plus `final_answer` and
+`status='completed'`, written in one transaction; `research_runs.final_answer` carries
+plain prose with no citation markers, because rendering is presentation. `alembic check`
+reports no drift at head `0004_research_synthesis`.
+
+**Verification** — 340 targeted tests, including adversarial prompt-injection coverage in
+English, Persian, and mixed content, and five defect-injection proofs. Full suite
+1833 passed / 20 failed *(figure at P3.8 — see the 2026-10-09 update below for the current baseline)*: the 20 are pre-existing P3.3/P3.4 defects, unchanged.
+`make verify` still fails on those. **The repository is not green and is not claimed to
+be.** Not verified against a live provider.
+
+---
+
+## Update — 2026-10-08 (Phase 3 P3.9 — Read-only audit + contract freeze)
+
+**No code changed.** P3.9 was a read-only stage. No orchestration, no `/research`,
+no chunk producer, no migration, no Celery configuration change, no dependency
+change. Production code, tests, and schema are unchanged, and the failed baseline
+(`1833 passed / 20 failed`, `ruff` 2, `mypy` 4 — all in the two P3.3 files) is
+carried forward unchanged. Status: **READY WITH PREREQUISITES**.
+
+**Canonical audit.** `docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md` § R is the
+single Phase 3 audit's P3.9 section, appended. The legacy
+`PHASE-03_P3-0_CONTRACT_FREEZE_AUDIT.md` remains as history; no second Phase 3
+audit was created. Reconciliation of that legacy file's open items is in § R.20.
+
+**Decisions recorded** — AD-043 (research execution is one Celery task per run with
+every stage inside it, on the worker's long-lived loop; chained stage tasks are
+unavailable because `task_ignore_result=True` and nothing reads results) and
+AD-044 (the orchestrator owns `completed` / `partial` / `failed`, extending
+AD-042 which correctly refused to decide `partial` from synthesis). AD-035's
+deadline *value* remains open.
+
+**Gaps found by the audit, all prerequisites for P3.9 implementation** (audit
+§ R.6, § R.9, § R.5, § R.18):
+
+1. **No `SourceChunk` producer.** `uow.source_chunks.add` has zero callers in
+   `app/` *and* `tests/`. `app/services/formatting.py` splits outgoing Telegram
+   messages and `plan_chunk_windows` packs already-persisted passages into prompt
+   windows — neither writes `source_chunks`. This is the blocker that keeps the
+   page-to-answer path unexercised.
+2. **`SourceRepository` cannot persist P3.5's output.** No writer exists for
+   `rank`, `quality_score`, `content_hash`, or `duplicate_of_id`. The consequence
+   is not cosmetic: `list_citable_for_run` orders by `sources.rank` and
+   `plan_synthesis_context` budgets on that order, so losing `rank` silently
+   de-ranks the evidence offered to the model. `tests/research_support.py` writes
+   `rank` with a raw `UPDATE` and says so in a comment.
+3. **No run-state writers.** Nothing writes `running` or `partial`, and
+   `ResearchRunRepositoryImpl.set_status` is the only research write that is not
+   ownership-scoped.
+4. **No research composition root.** `build_container` wires `ChatService`,
+   `DeliveryService`, `RateLimiter`, and the `Database` only. Every research stage
+   factory is called exclusively from `tests/`.
+5. **Execution-model risk.** Inherited limits are 100 s soft / 120 s hard. With
+   `task_acks_late=True` and `task_reject_on_worker_lost=True`, a task killed by
+   the hard limit is **redelivered and re-executed from the start**, so
+   idempotency is load-bearing. `SEARCH_API_KEY` is absent from `.env`, so
+   `Settings.search_enabled` is `False` here — a configuration state, not a defect.
+
+**Account deletion is complete and frozen** (audit § R.16): `users → research_runs →
+{sources, claims} → {source_chunks, citations}` are all `ON DELETE CASCADE`, removed
+in one `DELETE FROM users` inside one unit of work, tested against real PostgreSQL
+with a cross-user isolation assertion. Not a P3.9 prerequisite.
+
+---
+
+## Update — 2026-10-09 (Phase 3 P3.9-C — B5 / B6 operational decisions)
+
+**No code changed.** P3.9-C was a decision-and-documentation stage. No
+orchestration, no `/research` route, no rate limiter, no timeout handling, no
+Celery configuration change, no migration, no schema change, no dependency
+change, no test change. Production code and tests are byte-identical to the
+P3.9-B state.
+
+**Decisions recorded** — AD-045 (deadline mechanism), AD-046 (`/research`
+question length), AD-047 (research rate-limit policy). The Architecture Decision
+Log in `PROJECT_PLAN.md` is the authority; the evidence is canonical audit § S.
+
+**AD-045 — the deadline is cooperative, not signal-based.** This is the one with
+architectural consequence, because it changes how a research task may be written.
+Celery raises the soft time limit as a POSIX signal handled in the worker process
+(`billiard/pool.py:227-228`). This repository's task body is **synchronous** and
+blocks in `loop.run_until_complete()` (`app/infrastructure/asyncio_runtime.py:70-82`),
+so the exception is raised **in the awaiting frame, not inside the coroutine**.
+Verified by execution against the repository's own async bridge: on a soft
+timeout the in-flight `SqlAlchemyUnitOfWork.__aexit__`
+(`app/db/unit_of_work.py:54-72`) never runs — no commit, no rollback, no session
+close — and the coroutine is left `PENDING`. The control case (`asyncio.timeout`,
+already used by the fetch stage) unwinds correctly.
+
+Consequences for anyone implementing P3.9:
+
+- The deadline must be **in-coroutine**, checked at stage boundaries and before
+  provider calls. This is the only form in which "terminate with what it has"
+  (FR-44) is actually executable.
+- `SoftTimeLimitExceeded` must be caught **and must not reach the retry path** —
+  `research_task.py:92` defaults any exception to `getattr(exc, "retryable", True)`,
+  so an uncaught soft timeout would re-execute the whole run.
+- The existing per-stage transaction discipline already supports this: planning,
+  chunking, evidence, and synthesis each close their read transaction before any
+  provider call and commit separately. Chat cannot offer the same property, since
+  its turn is one transaction.
+- **The numeric deadline is BLOCKED.** No measurement exists; `SEARCH_API_KEY` is
+  absent so no run can execute; and no bound exists on candidates fetched per run.
+- **B7 (idempotency) becomes a prerequisite of B5**, not a parallel concern: with
+  `task_acks_late` + `task_reject_on_worker_lost`, a hard kill redelivers and
+  re-executes, and produces no partial status and no terminal message at all.
+
+**AD-046 — `/research` question length is the existing 2000.** `PLAN_MAX_QUESTION_CHARS`
+(`config.py:241`), enforced at `planner.py:112-119` before any provider call. aiogram's
+`Command` filter imposes no cap of its own (a 5000-character argument arrives intact),
+and Telegram's 4096 governs *outgoing* delivery only. Accepting 4000 at intake would
+create a run, a queue message, and a worker execution before rejecting an input —
+the opposite of § 15.9's "no run created". Token budgeting was measured and does
+**not** discriminate between the two values; that is recorded rather than dressed up.
+
+**AD-047 — research gets a dedicated rate-limit allowance**, separate from chat's,
+keyed by the same Telegram user id. **Numeric values BLOCKED.** Separately, and as a
+finding rather than a decision: **the global in-flight counter never returns to zero
+in the API process.** `check()` runs in the API process (`handlers.py:226`) and
+`release()` in the Celery worker process (`research_task.py:111`) against its own
+container — `docker-compose.yml` runs them as separate services. Verified by
+execution: after 8 lifetime messages the API refuses every user permanently with
+`global_capacity`. This is **pre-existing Phase 2 behaviour**, invisible to the tests
+because they drive handler and task in one process, and it is **reported, not fixed** —
+recorded as prerequisite B6-P4.
+
+**Baseline.** `pytest -q`: **1959 passed / 22 failed** (1981 collected); `ruff`: 4
+errors; `mypy app`: 12 errors. The `1833 / 20` figures recorded at P3.9 were true at
+that date; the difference is attributable to P3.9-A and P3.9-B adding test modules and
+code. **P3.9-C introduced nothing new to fix.** The repository is not green and is
+not claimed to be.
+
+---
+
+## Update — 2026-10-09 (Phase 3 P3.9 stabilization — defects fixed, suite green)
+
+**No new phase work.** A bug-fix/stabilization pass over the P3.9-A/P3.9-B working tree;
+no P3.9-D orchestration, `/research` handler, Celery research task, deadline flow, or
+rate limiter was added. No frozen P3.9-C decision was changed.
+
+**The recorded baseline was stale, and is corrected here.** The measured pre-fix
+baseline was **4 failed / 1977 passed / 1 error** (1981 collected; `ruff` 2, `mypy app`
+9). The 18 `_embedded_ipv6` failures the P3.9/P3.9-C notes attributed to P3.3 do not
+reproduce: the name no longer exists anywhere in `app/` or `tests/`, so those notes
+described a tree in which the P3.3 fix had not yet landed.
+
+**Defects fixed** (all reproduced, all in the Phase 3 audit § T):
+
+- `ResearchRunLifecycle` defined `describe` twice — the `@staticmethod` at `:265`
+  shadowed the transition-description method. Renamed to `describe_transition`;
+  `TransitionErrorKind` converted to `enum.StrEnum` so its members are typed, not bare
+  `str` (`app/domain/research/lifecycle.py`).
+- `BoundAsyncStream(response.stream, ...)` in the fetcher could not be type-narrowed
+  from the transport's `SyncByteStream | AsyncByteStream`; added an
+  `isinstance(..., httpx.AsyncByteStream)` assertion — no unchecked cast
+  (`app/infrastructure/fetch/client.py`).
+- `AppContainer.research_uow_factory` annotated `callable | None`; corrected to
+  `Callable[[], Any] | None` (`app/bot/container.py`).
+- `FetchHTTPStatusError` required `status_code`, breaking the convention that every
+  `ResearchError` subclass is constructible from one positional message; it is now
+  optional, with `retryable` false when absent and `for_status` remaining the typed
+  factory (`app/domain/errors.py`).
+- `idna` and `trafilatura` were imported but undeclared; both declared (already
+  installed, nothing added or upgraded) (`requirements.txt`).
+- Two test defects: an unused unpacked variable (`RUF059`), and a synthesis security
+  test that still expected `queued` after the P3.9-A fixture began seeding `running`.
+
+**The one behavioural change: `set_status` now locks the row it validates.** The method
+documents an atomic, ownership-scoped read-then-write, but the read used `session.get`
+with no lock, so under READ COMMITTED two concurrent transitions both read the old status
+and both wrote. The read is now `select(...).with_for_update()`. Ownership and the
+lifecycle policy are unchanged. This is what makes the concurrency test's "exactly one
+wins" assertion true; verified both ways (the test fails at `assert accepted is False`
+when the lock is removed). The test was also rewritten to run synchronously on the
+process's long-lived loop — calling `run_on_process_loop` from inside a `pytest-asyncio`
+async test raises `RuntimeError` — and to pass the internal user id rather than the
+Telegram id.
+
+**Status.** `pytest -q`: **1981 passed** (1981 collected); `ruff check app tests` clean;
+`mypy app` clean; `alembic check`: no new upgrade operations (no schema change, no new
+migration); `make verify` passes. **The repository is green.** Full record: canonical
+audit § T. Next stage: **P3.9 orchestration + `/research` trigger.**
+
+---
+
+## Update — 2026-10-10 (Phase 3 P3.9-D — research orchestration implemented)
+
+**The research path now runs end to end.** `ResearchOrchestrator`
+(`app/services/research/orchestrator.py`) is the pipeline; one Celery task per run
+(`app/tasks/research_pipeline_task.py`, `run_research(run_id, user_id, chat_id)`)
+executes it on the worker's long-lived event loop (AD-043 — all stages inside one
+task, not chained stage tasks); the `/research` handler
+(`app/bot/handlers.py`) parses, validates, throttles, acknowledges once, and
+enqueues. The container builder gained `_build_research_pipeline`, which composes
+the orchestrator from the existing services and the Phase 2 `LLMProvider` — no
+second client, no new dependency.
+
+**Control flow.** Handler → `ResearchIntakeService.accept` (derived request key,
+`ON CONFLICT`-idempotent run creation, B7) → one acknowledgement →
+`run_research.delay` → orchestrator: claim (`running`, ownership-scoped) → plan →
+search → fetch/extract/chunk bounded by `RESEARCH_MAX_SOURCES` → dedup/rank with
+P3.5 metadata persisted → per-source evidence with a `SELECT … FOR UPDATE` claim
+guard against re-analysis → synthesis (`completed` or `partial`) → terminal
+summary (`set_summary_note`, status-free) → **one** terminal message. Every stage
+commits in its own short unit of work; providers are called outside transactions.
+
+**Deadline and outcome model (AD-044, AD-045).** `app/domain/research/outcome.py`
+holds `RunOutcomeKind`, the latching `CooperativeDeadline` (injected clock;
+`RESEARCH_DEADLINE_SECONDS=None` means unbounded — no invented number), and
+`summarize_run` (counts-only). `ResearchDeadlineError` and the no-evidence and
+pipeline errors are typed and mapped in `failures.py`. The Celery soft limit stays
+a backstop and is caught **non-retryably** (B5-C1): the default
+`getattr(exc, "retryable", True)` would re-execute a run that already spent its
+budget.
+
+**Schema: one migration.** `0005_research_request_key` adds a nullable
+`research_runs.request_key` (`String(32)`) and `UNIQUE (user_id, request_key)`.
+No new table; the five-table model (AD-034) is unchanged.
+
+**Rate limiting (AD-047).** Research is admitted through
+`RateLimiter.check_share` — per-user window and daily allowance, no global
+in-flight slot, so the documented cross-process leak (B6-P4) is not inherited.
+Chat's controls are untouched. The **numbers remain BLOCKED**; so does the
+deadline value.
+
+**Status.** `pytest -q`: **2063 passed / 1 failed** (2064 collected); the failure
+is the SSRF system-resolver test and is environmental — this machine's DNS
+wildcard-resolves every name to `198.18.0.0/15` — not a regression. `ruff` and
+`mypy app` clean; `alembic check`: no new upgrade operations. Full record:
+canonical audit § U; phase record: PHASE-03 § 23. Nothing is committed.
 
 ---
 
@@ -830,3 +1371,23 @@ is not something a deployment can reason about.
 **The stated limit.** If a future environment also rewrites HTTPS, DoH will not
 help. The fix then belongs on the host, in the DNS interception, and must not be
 found by loosening the SSRF policy.
+
+---
+
+## AD-049 — AI-provider 403 is an edge block; do not retry it
+
+**Status:** a `/research` run failed with `LLMServiceError(retryable=False)`
+from a `403`. Neither obvious reading survives: a deliberately-bogus key
+produces a byte-identical response, so the credential was never examined. Full
+record:
+[`adr/000049-ai-provider-403-is-an-edge-block.md`](./adr/000049-ai-provider-403-is-an-edge-block.md).
+
+**AD-049 — no code change, and here is why.** The refusal carries
+`server: cloudflare` and a `cf-ray` header against a genuine `api.groq.com`
+certificate, and `GET /v1/models` fails identically. The block is at the edge,
+before Groq's authentication. `app/infrastructure/llm.py` already treats 403 as
+non-transient, and 429/408/409 are already retried with `retry_backoff` **and**
+`retry_jitter` at the task level, and again by the SDK's own `max_retries`.
+Adding backoff for a 403 would turn a fast honest failure into a slow one that
+spends the run's budget to report the same thing. Both branches the brief
+anticipated — quota and transient — are already handled and tested.
