@@ -25,8 +25,28 @@ pydantic-settings==2.7.0
 # `python-dotenv` is deliberately not pinned: pydantic-settings declares it as
 # a hard requirement, and the `env_file` support this project relies on comes
 # from it.
-# `httpx` is deliberately not pinned: the openai SDK declares it as a hard
-# requirement and it is used for all provider HTTP traffic.
+
+# --- Outbound HTTP (Phase 3 P3.2) ---
+# The audit's dependency audit (Phase 3 § "Dependency audit") called for httpx to
+# be promoted from a transitive pin to an explicit one. It was previously
+# present only because the openai SDK requires it and was never imported by
+# app/. Phase 3 P3.2 imports it directly for the search provider adapter.
+# httpx is pinned at the version already resolved transitively by
+# openai==2.44.0, so this adds no new version to the tree.
+httpx==0.28.1
+
+# idna: IDNA (RFC 3490/5891) encoding of internationalised hostnames. The SSRF
+# validator canonicalises a unicode hostname with it before resolution (P3.3).
+# Imported lazily in app/infrastructure/fetch/ssrf.py, so only unicode
+# hostnames need it at runtime, but it is declared explicitly because a clean
+# install must be able to resolve it.
+idna==3.18
+
+# --- Content extraction (Phase 3 P3.4) ---
+# trafilatura: readable-text extraction from fetched HTML (P3.4, FR-16). It is
+# the extractor's main-document engine and is imported directly by
+# app/infrastructure/extract/extractor.py, so it must be an explicit pin.
+trafilatura==2.3.1
 
 # --- AI provider (OpenAI-compatible) ---
 # Added in Phase 1. Was imported by app/ but undeclared, so a clean environment

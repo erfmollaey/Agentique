@@ -22,6 +22,7 @@ from app.db.session import (
 
 # --- Isolation guard (Phase 2 § 23) ---------------------------------------
 
+
 def test_the_guard_accepts_a_database_named_for_testing():
     url = "postgresql+asyncpg://u:p@localhost:5432/research_db_test"
     assert resolve_database_url(url, require_test=True) == url
@@ -90,6 +91,7 @@ def test_an_operator_may_still_migrate_a_real_database(monkeypatch):
 
 # --- T-18: migrations apply and roll back ---------------------------------
 
+
 def test_the_test_database_is_at_the_migration_head(database):
     """The session-scoped migration fixture has already run."""
 
@@ -98,15 +100,24 @@ def test_the_test_database_is_at_the_migration_head(database):
             result = await connection.execute(text("SELECT version_num FROM alembic_version"))
             return result.scalar_one()
 
-    assert _run(current()) == "0001_phase2"
+    assert _run(current()) == "0005_research_request_key"
 
 
-def test_the_migrated_schema_has_exactly_the_three_phase2_tables(database):
+def test_the_migrated_schema_has_all_phase2_and_phase3_tables(database):
     async def names() -> set[str]:
         async with database.engine.connect() as connection:
             return await connection.run_sync(_inspect_tables)
 
-    assert _run(names()) == {"users", "conversations", "messages"}
+    assert _run(names()) == {
+        "users",
+        "conversations",
+        "messages",
+        "research_runs",
+        "sources",
+        "source_chunks",
+        "claims",
+        "citations",
+    }
 
 
 def test_migrations_round_trip_on_a_dedicated_scratch_database(database_url):
@@ -169,12 +180,27 @@ def test_migrations_round_trip_on_a_dedicated_scratch_database(database_url):
     try:
         # 1. empty -> head
         migrate("upgrade")
-        assert _run(tables()) == {"users", "conversations", "messages"}
+        assert _run(tables()) == {
+            "users",
+            "conversations",
+            "messages",
+            "research_runs",
+            "sources",
+            "source_chunks",
+            "claims",
+            "citations",
+        }
         assert index_names(scratch_url) >= {
             "ix_users_telegram_user_id",
             "ix_conversations_user_id",
             "ix_conversations_user_id_updated_at",
             "ix_messages_conversation_id_created_at",
+            "ix_research_runs_user_id_created_at",
+            "ix_sources_run_id_rank",
+            "ix_sources_content_hash",
+            "ix_claims_run_id",
+            "ix_citations_claim_id",
+            "ix_citations_source_id",
         }
 
         # 2. head -> base
@@ -183,7 +209,16 @@ def test_migrations_round_trip_on_a_dedicated_scratch_database(database_url):
 
         # 3. base -> head again: the migration is not one-way
         migrate("upgrade")
-        assert _run(tables()) == {"users", "conversations", "messages"}
+        assert _run(tables()) == {
+            "users",
+            "conversations",
+            "messages",
+            "research_runs",
+            "sources",
+            "source_chunks",
+            "claims",
+            "citations",
+        }
     finally:
         _run(admin_command(f'DROP DATABASE IF EXISTS "{scratch_name}"'))
 
@@ -217,6 +252,7 @@ def test_the_models_and_the_migrations_agree(database_url):
 
 
 # --- helpers ---------------------------------------------------------------
+
 
 def _inspect_tables(connection):
     """Synchronous helper for ``AsyncConnection.run_sync``."""

@@ -1,7 +1,7 @@
 # Phase 1 — Core Infrastructure & Stabilization
 
-**Status:** In Progress — implementation and validation complete; blocked on manual credential rotation and two environment gates
-**Active Phase:** Yes
+**Status:** Complete — the three items that blocked closure (credential rotation, Docker verification, CI provider) were subsequently resolved; see the reconciliation note in § 14 (2026-10-07)
+**Active Phase:** No (Phase 3 is the active phase)
 **Evidence base:** [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — historical audit snapshot, preserved unmodified
 **Implementation record:** § 14. `docs/ARCHITECTURE.md` describes the repository **as it was before this phase**; its findings are retained as the defect baseline, not as a statement of current state. The current state is recorded in § 14 and in [`../PROJECT_PLAN.md`](../PROJECT_PLAN.md).
 
@@ -461,24 +461,33 @@ Phase 1 is complete when **all** of the following are true:
 
 ## 14. Status
 
-**Current status: In Progress.**
+**Current status: Complete (reconciled 2026-10-07).**
 
-Implementation and validation are complete. The phase is **not** complete, because
-three items cannot be satisfied in this environment:
+Implementation and validation are complete. When this record was written, the
+phase could not be closed because three items could not be satisfied in that
+environment. All three have since been resolved:
 
-1. **Credential rotation** — requires human access to @BotFather and the provider
-   dashboard. SR-4, P0-3, and the related acceptance criterion remain open.
-2. **Docker image build** — the `Dockerfile` is written and passes
-   `docker build --check`, but `pip install` inside the container fails on PyPI
-   network truncation (`IncompleteRead` / `SSLError` from pypi.org). The same
-   `requirements.txt` installs cleanly on the host, so this is an environment
-   fault, not a defect in the file. **NOT VERIFIED — the image has never been
-   built or run.**
-3. **CI configuration** — `ruff`, `mypy`, and `pytest` are wired through
-   `make verify` and all pass, but no CI provider is configured because the
-   repository is not a git repository.
+1. **Credential rotation** — **resolved.** The exposed credentials (Telegram bot
+   token, AI provider key, and the previously hardcoded OpenRouter-format key)
+   were rotated/revoked by a human before Phase 2. The exposure predates this
+   repository's git history: a full scan of every commit finds no secret-shaped
+   value in any tracked file, and `.env` was never committed. SR-4 and P0-3 are
+   closed.
+2. **Docker image build** — **resolved.** The image was built and run during
+   Phase 2 verification with only the `FROM` line substituted (Docker Hub was
+   unreachable from that environment); the committed `Dockerfile` was not
+   modified, and the API, worker, and migration containers all ran correctly
+   against real PostgreSQL and Redis. The Docker Compose configuration was
+   verified. See `PHASE-02-AI-CHAT.md` § 14, "Docker verification, in full".
+3. **CI configuration** — **resolved.** The repository is now a git repository
+   with `.github/workflows/ci.yml` (lint, typecheck, migrations, test suite,
+   secret scan). GitHub Actions has executed the workflow and is green.
 
-**Phase status in `docs/PROJECT_PLAN.md`: In Progress.**
+The pre-reconciliation text of this section is preserved in git history; the
+resolutions above are the reconciliation, not a rewrite of what was open at the
+time.
+
+**Phase status in `docs/PROJECT_PLAN.md`: Complete.**
 
 ### What changed
 
@@ -588,7 +597,7 @@ change. Recorded because they are real findings.
 |---|---|---|
 | P0-1 | Remove hardcoded LLM key | Implemented |
 | P0-2 | Read credentials from settings | Implemented |
-| P0-3 | Rotate exposed credentials | **Not Implemented — manual human action, blocking** |
+| P0-3 | Rotate exposed credentials | **Implemented — completed by human action before Phase 2** (reconciled 2026-10-07) |
 | P0-4 | Add `.gitignore` | Implemented |
 | P0-5 | Add `.env.example` | Implemented |
 | P0-6 | Add missing `openai` dependency | Implemented |
@@ -613,7 +622,7 @@ change. Recorded because they are real findings.
 | P1-7 | Typed LLM response validation | Implemented |
 | P1-8 | Rate limiting and cost control | Implemented (in-process; see limitations) |
 | P1-9 | Celery configuration | Implemented |
-| P1-10 | Docker application and worker services | **Partial** — files written and compose-valid; image build blocked by network |
+| P1-10 | Docker application and worker services | **Implemented** — compose configuration verified; image built and API/worker/migration containers run correctly (Phase 2 § 14; base-image substitution was required in that sandboxed environment) |
 | P1-11 | Remove unused dependencies | Implemented |
 | P1-12 | Consolidate logging | Implemented |
 | P1-13 | Robust configuration | Implemented |
@@ -626,13 +635,13 @@ change. Recorded because they are real findings.
 | SR-1 | No secret literal in any file under `app/` | Implemented (test-enforced) |
 | SR-2 | `.env` excluded from version control | Implemented |
 | SR-3 | `.env.example` contains no real values | Implemented |
-| SR-4 | **Credentials rotated** | **Not Implemented — manual human action, blocking** |
+| SR-4 | **Credentials rotated** | **Implemented — completed by human action before Phase 2** (reconciled 2026-10-07) |
 | SR-5 | Secrets never written to logs | Implemented; verified against a live run |
 | SR-6 | User text never gains capability | Implemented (single user-role prompt retained; no external content in Phase 1) |
 | SR-7 | No file path, URL, or command from user input | Implemented (no such surface exists) |
 | SR-8 | Infrastructure not on default credentials | Implemented; compose requires `POSTGRES_PASSWORD` and binds ports to loopback |
 | SR-9 | Health endpoint reveals no secret | Implemented; asserted by test |
-| SR-10 | Secret-scanning check in CI | **Partial** — implemented as a test, not wired to a CI provider (no git repository) |
+| SR-10 | Secret-scanning check in CI | **Implemented** — enforced as a test and as a GitHub Actions workflow step; CI green (reconciled 2026-10-07) |
 
 ### Work item status — tests
 
@@ -654,11 +663,14 @@ change. Recorded because they are real findings.
 
 ### Blockers
 
-| Blocker | Blocks | Who resolves it |
-|---|---|---|
-| **Credential rotation** (P0-3, SR-4) | Phase 1 completion | **Human.** @BotFather `/token` revoke; provider dashboard revoke; the previously hardcoded OpenRouter-format key revoked in the OpenRouter account |
-| **Docker image build** (P1-10) | Two acceptance criteria | Environment. Retry `docker build .` on a network that can reach pypi.org |
-| **CI provider** (SR-10 tail) | One acceptance criterion | Human. `git init`, then add a CI workflow running `make verify` |
+**All three blockers were subsequently resolved (reconciled 2026-10-07).** The
+table is preserved as the record of what was open and who had to resolve it.
+
+| Blocker | Blocks | Who resolves it | Resolution |
+|---|---|---|---|
+| **Credential rotation** (P0-3, SR-4) | Phase 1 completion | **Human.** @BotFather `/token` revoke; provider dashboard revoke; the previously hardcoded OpenRouter-format key revoked in the OpenRouter account | **Resolved** — completed before Phase 2; no secret exists anywhere in git history (full-history scan) |
+| **Docker image build** (P1-10) | Two acceptance criteria | Environment. Retry `docker build .` on a network that can reach pypi.org | **Resolved** — image built and containers verified in Phase 2 § 14 (base-image substitution in that environment); compose configuration verified |
+| **CI provider** (SR-10 tail) | One acceptance criterion | Human. `git init`, then add a CI workflow running `make verify` | **Resolved** — git repository initialized, `.github/workflows/ci.yml` added, GitHub Actions green |
 
 ### Update procedure
 

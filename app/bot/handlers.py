@@ -41,6 +41,7 @@ HELP_TEXT = (
     "/new — start a new conversation\n"
     "/conversations — list your conversations\n"
     "/reset — clear this conversation (asks for confirmation)\n"
+    "/research — research a question on the web and answer it with citations\n"
     "/delete_account — delete everything stored about you (asks for confirmation)\n\n"
     "Anything that is not a command is sent to me as a message."
 )
@@ -54,6 +55,16 @@ QUEUE_UNAVAILABLE_TEXT = "The processing queue is unavailable. Please try again 
 GLOBAL_CAPACITY_TEXT = "Processing capacity is full. Please try again shortly."
 GENERIC_ERROR_TEXT = "Something went wrong. Please try again."
 ACKNOWLEDGEMENT_TEXT = "💭 Thinking…"
+RESEARCH_ACKNOWLEDGEMENT_TEXT = (
+    "🔍 I'm on it. Research takes a while — I'll send the answer when it's ready."
+)
+RESEARCH_USAGE_TEXT = (
+    "Tell me what to research. For example:\n/research What did the 2024 "
+    "survey find?"
+)
+RESEARCH_TOO_LONG_TEXT = (
+    "That research question is too long. Please keep it under 2000 characters."
+)
 RESET_CONFIRM_TEXT = (
     "This will delete every message in the current conversation. The "
     "conversation itself is kept. Send /reset confirm to go ahead."
@@ -97,6 +108,43 @@ def _throttle_text(decision: ThrottleDecision) -> str:
     if decision.reason == "daily_quota":
         return RATE_LIMITED_TEXT.format(seconds=decision.retry_after_seconds)
     return RATE_LIMITED_TEXT.format(seconds=decision.retry_after_seconds)
+
+
+async def _fail_research(container: AppContainer, run_id: int, user_id: int) -> None:
+    """Compensating transition for a run whose task could not be enqueued.
+
+    Without this, a broker outage leaves the run at ``queued`` forever — the user was
+    paid in an acknowledgement, and the run looks active to every reader. Marking it
+    ``failed`` (the one transition the lifecycle permits from ``queued``) makes the
+    state honest: nothing will execute it and nothing is left pretending otherwise.
+
+    The alternative — an outbox table — is deliberately not used: the five-table
+    research schema is frozen (AD-034) and no Phase 3 contract asks for one. The
+    failure is also rare and the run was created microseconds earlier, which is what
+    makes the compensation safe: the window between the two is the unit of work that
+    created the run.
+    """
+    research = container.research
+    if research is None:
+        return
+
+    uow_factory = getattr(research, "_uow", None)
+    if uow_factory is None:
+        return
+
+    async def _transition() -> None:
+        async with uow_factory() as uow:
+            await uow.research_runs.set_status(
+                run_id, user_id, "failed", failure_summary="not started: queuing failed"
+            )
+
+    try:
+        # Awaited, not driven on the process loop: this is already inside the
+        # dispatcher's coroutine, and the project's loop rules forbid starting a
+        # second loop from one (see the skill note on ``run_on_process_loop``).
+        await _transition()
+    except Exception:
+        log.exception("could not compensate a failed research enqueue: run=%d", run_id)
 
 
 def register_handlers(dispatcher: Dispatcher, container: AppContainer) -> None:
@@ -151,7 +199,6 @@ def register_handlers(dispatcher: Dispatcher, container: AppContainer) -> None:
 
     @router.message(Command("reset"))
     async def reset_conversation_command(message: Message, command: CommandObject) -> None:
-        """FR-20: a destructive command requires explicit confirmation."""
         argument = (command.args or "").strip().lower()
         if argument != "confirm":
             await message.answer(RESET_CONFIRM_TEXT)
@@ -187,6 +234,104 @@ def register_handlers(dispatcher: Dispatcher, container: AppContainer) -> None:
         log.info("account deletion confirmed chat=%s user=%s",
                  message.chat.id, _safe_user_id(message))
         await _run_command(message, lambda turn: _chat().delete_all_user_data(turn))
+
+    @router.message(Command("research"))
+    async def research_command(message: Message, command: CommandObject) -> None:
+        """AD-029 / § 15.1: ``/research <question>`` — one question, one run, one reply.
+
+        Registered after the known commands and *before* the unknown-command filter,
+        so it is matched before ``F.text.startswith("/")`` swallows it. The order is
+        load-bearing (audit F-1).
+
+        The handler parses, validates, enqueues, and returns. It does no AI work, no
+        SQL, and no event-loop management: the intake service owns the run's
+        creation, the Celery task owns the pipeline, and the delivery service owns the
+        message.
+        """
+        user_id = _safe_user_id(message)
+        if user_id is None:
+            await message.answer(UNSUPPORTED_TEXT_TEXT)
+            return
+
+        question = (command.args or "").strip()
+
+        # Rejected at intake, before any state is created (§ 15.9: an invalid request
+        # produces no run, no user row, and no queue message).
+        if not question:
+            await message.answer(RESEARCH_USAGE_TEXT)
+            return
+        if len(question) > container.settings.PLAN_MAX_QUESTION_CHARS:
+            log.info(
+                "research rejected: too long chat=%s user=%s chars=%d limit=%d",
+                message.chat.id, user_id, len(question),
+                container.settings.PLAN_MAX_QUESTION_CHARS,
+            )
+            await message.answer(RESEARCH_TOO_LONG_TEXT)
+            return
+
+        # AD-047: research has its own allowance, keyed by the same Telegram user
+        # id, and uses the share that is correct across processes (see
+        # ``RateLimiter.check_share`` on why the global slot is not taken here).
+        limiter = container.research_rate_limiter
+        decision = limiter.check_share(user_id) if limiter is not None else None
+        if decision is not None and not decision.allowed:
+            log.info(
+                "research throttled: user=%s reason=%s", user_id, decision.reason
+            )
+            await message.answer(_throttle_text(decision))
+            return
+
+        # Imported here, not at module scope, so this module has no import-time
+        # dependency on the task package (the same discipline the chat handler uses).
+        from app.tasks.research_pipeline_task import run_research
+
+        accepted = None
+        try:
+            accepted = await container.intake.accept(
+                telegram_user_id=user_id,
+                telegram_message_id=message.message_id,
+                username=message.from_user.username if message.from_user else None,
+                question=question,
+            )
+        except Exception as exc:  # one notice, no stack trace
+            log.warning("research rejected: user=%s", user_id, exc_info=False)
+            await message.answer(user_message_for(exc))
+            return
+
+        # A redelivered command converges on the run that already exists, so it must
+        # not be acknowledged as a fresh acceptance (B7).
+        if not accepted.created:
+            log.info(
+                "research already accepted: run=%d chat=%s user=%d",
+                accepted.run.id, message.chat.id, user_id,
+            )
+            await message.answer(ACKNOWLEDGEMENT_TEXT)
+            return
+
+        try:
+            run_research.delay(
+                run_id=accepted.run.id,
+                user_id=accepted.run.user_id,
+                chat_id=message.chat.id,
+            )
+        except Exception:
+            # The run exists but no worker will ever see it, leaving a run that looks
+            # active forever. The compensating transition makes it honest (AD-043):
+            # a run that was never started is marked failed, not left queued.
+            log.error(
+                "could not enqueue research run: run=%d", accepted.run.id
+            )
+            await _fail_research(container, accepted.run.id, accepted.run.user_id)
+            await message.answer(QUEUE_UNAVAILABLE_TEXT)
+            return
+
+        log.info(
+            "research accepted: run=%d chat=%s user=%d chars=%d",
+            accepted.run.id, message.chat.id, user_id, len(question),
+        )
+        # Exactly one acknowledgement for a successfully accepted request, and exactly
+        # one terminal message later — no progress updates in between (§ 15.1).
+        await message.answer(RESEARCH_ACKNOWLEDGEMENT_TEXT)
 
     # Any command that is not recognised. Registered after the known commands,
     # so those are matched first and never fall through to here.

@@ -12,7 +12,7 @@ from typing import Protocol
 from app.core.config import Settings
 from app.domain.errors import DeliveryError
 from app.infrastructure.asyncio_runtime import get_event_loop, run_coroutine
-from app.services.formatting import split_for_telegram
+from app.services.formatting import split_for_telegram, telegram_chunk_limit
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class DeliveryService:
 
         Returns the number of messages sent.
         """
-        limit = min(self._settings.TELEGRAM_MAX_MESSAGE_LENGTH, 4096) - 16
+        limit = telegram_chunk_limit(self._settings.TELEGRAM_MAX_MESSAGE_LENGTH)
         chunks = split_for_telegram(text, limit) or [text]
 
         sent = 0

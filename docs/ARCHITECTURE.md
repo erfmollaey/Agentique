@@ -1346,6 +1346,63 @@ canonical audit § U; phase record: PHASE-03 § 23. Nothing is committed.
 
 ---
 
+## Update — 2026-10-13 (Phase 3 closure: citation rendering, token accounting, provider decision)
+
+**Three blockers closed, and the stale baseline corrected.**
+
+**Citation rendering (FR-40).** `app/services/research/rendering.py` renders a
+verified `SynthesizedAnswer` into ready-to-send messages: inline `[n]` markers at the
+end of each section, then a numbered source list carrying the persisted title, domain,
+URL, and locator. `ResearchOutcome` gained a `messages` field, and
+`run_research` sends those parts in order. Three properties are structural rather than
+conventional:
+
+- **Numbering is per source, not per citation.** Two passages of one document are one
+  reference, so a list that printed the same URL twice would read as two independent
+  sources.
+- **Markers are section-level**, because that is the granularity at which support was
+  verified (§ 19.3). Nothing claims a sentence-level correspondence no check
+  established.
+- **The renderer verifies nothing and invents nothing.** It renders only the citations
+  `verify_synthesis` already accepted, whose every field was copied from persisted rows.
+  A citation that did not resolve never became part of an answer, so there is nothing
+  here to strip.
+
+Chunks are packed on line boundaries to the **same limit `DeliveryService` applies**
+(`formatting.telegram_chunk_limit`), so a marker, a source label, and its URL are
+never torn apart, no entry is duplicated by the split, and nothing is truncated. All
+dynamic values are HTML-escaped, because the bot's default parse mode is HTML and a
+retrieved page title is untrusted content (SR-3).
+
+**Per-run token accounting (FR-9, SR-5, T-25).**
+`app/services/research/usage.py` adds a `RunTokenLedger` and `UsageRecordingLLM`, a
+pass-through that records only the usage the provider reported. The composition root
+hands the four research adapters the shared provider behind it; `ChatService` keeps the
+raw client and its own per-turn accounting. The orchestrator opens one ledger scope
+per run and the totals are written through the lifecycle's existing `set_status`
+parameters — in the same transaction as the answer on success, and on the terminal
+failure write when there is no answer. **No budget is enforced, no pricing is
+modelled, and no limit is invented:** enforcement stays deferred under AD-047, and the
+values are set rather than incremented so a repeated write cannot double-count.
+
+**Search provider (AD-050).** `SEARCH_PROVIDER` now defaults to **`tavily`**, and the
+Brave adapter remains registered. The rationale is budget: a credential now exists,
+which discharged audit § K.10's outstanding item, and on that re-evaluation Tavily met
+the required functionality within this project's free-tier allowance where Brave was
+not a viable free option. No comparative quality benchmark was run, so those axes remain
+**NOT VERIFIED**; the decision claims nothing beyond the budget rationale and nothing
+about long-term pricing. The decision to put search behind `SearchProvider` is
+unchanged, so re-selecting is a configuration value.
+
+**Corrected baseline.** The `2063 passed / 1 failed` figure above no longer holds. The
+environmental DNS failure it recorded does not reproduce — this machine's resolver now
+fails `nonexistent.invalid` correctly — and the repository has grown since. Fresh
+measured figures are in PHASE-03 § 24 and canonical audit § V.
+
+Full record: canonical audit § V; phase record: PHASE-03 § 24.
+
+---
+
 ## AD-048 — DNS resolution for the fetch boundary
 
 **Status:** `FetchBlockedDestinationError` on every fetch, with search, planning

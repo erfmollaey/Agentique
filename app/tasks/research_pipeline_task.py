@@ -43,6 +43,13 @@ second notice (B7, § R.14). Nothing here holds a lock across the send: the run'
 status is committed before delivery begins, and a failed delivery leaves the run
 terminal and the answer stored, which is the state Phase 2's chat path already treats
 as "redelivery re-sends it" (§ 15.9 row: Delivery failure, R).
+
+**A terminal failure leaves a terminal row.** The exhaustion branch of
+``_handle_failure`` writes the failed status and its reason *before* it builds the
+notice, so the two possible ends of a run — answer and failure — both leave a row
+that says so, and neither can be interrupted by the delivery that follows into a
+looks-active lie. An intermediate retry deliberately writes nothing: that attempt
+is not the end of the run.
 """
 
 from __future__ import annotations
@@ -121,7 +128,9 @@ def run_research(self, run_id: int, user_id: int, chat_id: int) -> int:
             "research soft time limit reached: run=%d user=%d task=%s retries=%s",
             run_id, user_id, self.request.id, self.request.retries,
         )
-        _mark_failed(container, run_id, user_id)
+        _mark_failed(
+            container, run_id, user_id, "stopped early: task soft time limit"
+        )
         return _send(container, chat_id, _STOPPED_EARLY_MESSAGE)
     except Exception as exc:  # bounded retry, then one terminal notice
         return _handle_failure(self, container, chat_id, run_id, user_id, exc)
@@ -131,14 +140,21 @@ def run_research(self, run_id: int, user_id: int, chat_id: int) -> int:
     return _deliver(container, chat_id, outcome)
 
 
-def _mark_failed(container: AppContainer, run_id: int, user_id: int) -> None:
+def _mark_failed(
+    container: AppContainer, run_id: int, user_id: int, failure_summary: str
+) -> None:
     """Record a terminal failure for a run the orchestrator could not finish.
 
-    Used only where the coroutine was interrupted and its own terminal write never
-    ran — the signal-based soft limit. Without it the row is left at ``running``,
-    which is a lie two readers act on: a redelivered task re-claims it (now
-    handled, but only for a run this user owns) and every reader counts the run as
-    still active.
+    Used where the coroutine was interrupted and its own terminal write never
+    ran — the signal-based soft limit, and an exhausted stage failure. Without it
+    the row is left at ``running``, which is a lie two readers act on: a
+    redelivered task re-claims it (now handled, but only for a run this user
+    owns) and every reader counts the run as still active.
+
+    ``failure_summary`` is written by the caller and must be a reason the caller
+    itself composed. It is never the exception's text, which can echo a provider
+    message or a credential (SR-5); the callers here pass either a fixed phrase
+    or the exception's *class name*, which is this codebase's own type name.
 
     Ownership-scoped, and terminal-state-tolerant: a row already ``failed`` is
     not an error worth raising here, because the purpose is to leave *a* truthful
@@ -161,7 +177,7 @@ def _mark_failed(container: AppContainer, run_id: int, user_id: int) -> None:
                     run_id,
                     user_id,
                     "failed",
-                    failure_summary="stopped early: task soft time limit",
+                    failure_summary=failure_summary,
                 )
         except TransitionError as exc:
             # Terminal or same-state: the row already says what this call would
@@ -189,13 +205,23 @@ def _mark_failed(container: AppContainer, run_id: int, user_id: int) -> None:
 
 
 def _deliver(container: AppContainer, chat_id: int, outcome: ResearchOutcome) -> int:
-    """Send the run's one terminal message.
+    """Send the run's terminal message.
 
     A verified answer when there is one, and an explicit no-evidence notice when
     there is not. Never both, never neither: a run that produced a usable answer
     receives that answer, and a run that produced none is told so rather than being
     delivered a fabricated summary of what failed (§ 15.9, FR-41).
+
+    **One logical message, possibly several Telegram messages.** When the run has a
+    verified answer, ``outcome.messages`` is the rendered form — the answer with its
+    inline citation markers and the numbered source list, already split so each part
+    is within the platform's limit (FR-40). They are sent in order and none is sent
+    twice, so a long cited answer arrives whole rather than truncated. The fallback
+    to ``outcome.answer`` is for a run whose rendering fell back to plain prose; the
+    notice is for a run with no verified answer at all.
     """
+    if outcome.messages:
+        return _send_messages(container, chat_id, outcome.messages)
     text = outcome.answer if outcome.answer else _NO_ANSWER_MESSAGE
     return _send(container, chat_id, text)
 
@@ -210,6 +236,11 @@ def _handle_failure(
     retry a soft limit, and § S.2(2) shows why that is wrong. Everything else follows
     the established policy, including the user not being messaged on an attempt that
     will be retried.
+
+    The two branches write different amounts of state, deliberately: an attempt
+    that will be retried leaves the row exactly as it found it, because the run is
+    still alive; the final attempt marks the run failed before it sends anything,
+    because the run is over either way the send goes.
     """
     retryable = getattr(exc, "retryable", True)
 
@@ -236,6 +267,24 @@ def _handle_failure(
             exc=exc, countdown=_backoff(self.request.retries)
         ) from exc
 
+    # The retry allowance is exhausted (or the failure was never retryable), so
+    # this run is over: the row is made terminal *before* the notice is sent.
+    # Ordered this way on purpose — a delivery failure then leaves the run
+    # ``failed`` rather than ``running``, which is the state Run 18 was left in
+    # when its terminal notice was delivered and the row was not.
+    #
+    # Only the exception's class name reaches storage. ``str(exc)`` can carry a
+    # provider's message, a SQL fragment, or a credential echoed back by a
+    # service, and ``failure_summary`` is an operator's field, not a user one
+    # (SR-5). ``_mark_failed`` never raises, so it cannot mask the failure the
+    # user is about to be told about.
+    _mark_failed(
+        container,
+        run_id,
+        user_id,
+        f"research failed: {type(exc).__name__}",
+    )
+
     notice = (
         _STOPPED_EARLY_MESSAGE
         if _is_soft_limit(exc)
@@ -260,5 +309,30 @@ def _send(container: AppContainer, chat_id: int, text: str) -> int:
     sent = container.delivery.send(chat_id, text)
     log.info(
         "research terminal delivered: chat=%s messages=%s", chat_id, sent
+    )
+    return sent
+
+
+def _send_messages(
+    container: AppContainer, chat_id: int, texts: tuple[str, ...]
+) -> int:
+    """Send a pre-split terminal message in order, returning how many went out.
+
+    Each element is already within Telegram's limit, so ``DeliveryService`` does not
+    re-split it and the citation markers and source entries the renderer placed stay
+    exactly where it put them.
+
+    A failure part-way through is **not** swallowed: the exception propagates to
+    ``_handle_failure`` like any other delivery failure, so a partially delivered
+    answer is an error the run's own policy sees rather than a silent truncation.
+    The answer is already persisted on the run, so the existing redelivery path can
+    re-send it (§ 15.9, Delivery failure).
+    """
+    sent = 0
+    for text in texts:
+        sent += container.delivery.send(chat_id, text)
+    log.info(
+        "research terminal delivered: chat=%s messages=%s parts=%s",
+        chat_id, sent, len(texts),
     )
     return sent

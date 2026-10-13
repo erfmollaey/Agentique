@@ -85,6 +85,52 @@ class RateLimiter:
             self._in_flight += 1
             return ThrottleDecision(allowed=True)
 
+    def check_share(self, user_id: int) -> ThrottleDecision:
+        """The per-user allowance, without taking a global concurrency slot.
+
+        Used by the research intake path, and the reason it exists is a documented
+        **cross-process defect** (audit § S.6.2 / prerequisite B6-P4):
+        ``MAX_IN_FLIGHT_REQUESTS`` is taken in the API process at intake and released
+        by the worker process on completion, and those are two separate
+        ``RateLimiter`` instances with two separate counters. The API's only ever
+        climbs, so after ``MAX_IN_FLIGHT_REQUESTS`` lifetime requests the API
+        process refuses *every* user, permanently.
+
+        Research must not inherit that defect: a research run occupies a worker for
+        minutes on one shared queue, so taking an unreleasable slot would make the
+        command unusable after eight messages. The per-user sliding window and daily
+        allowance are unaffected — both are taken and reported inside the same process
+        that holds the user, so they remain correct — and those are what
+        ``check_share`` consults.
+
+        This does **not** fix B6-P4 and does not claim to. Fixing it requires a
+        durable, cross-process in-flight store, which is a broader design decision
+        than the Phase 3 request path; the block is recorded rather than worked
+        around by weakening the control.
+        """
+        now = self._clock()
+        with self._lock:
+            daily = self._prune(self._daily.setdefault(user_id, deque()), now, self._daily_window)
+            if len(daily) >= self._daily_max:
+                return ThrottleDecision(
+                    allowed=False,
+                    reason="daily_quota",
+                    retry_after_seconds=max(int(self._daily_window - (now - daily[0])) + 1, 1),
+                )
+
+            bucket = self._prune(self._hits.setdefault(user_id, deque()), now, self._window)
+            if len(bucket) >= self._max_requests:
+                retry_after = int(self._window - (now - bucket[0])) + 1
+                return ThrottleDecision(
+                    allowed=False,
+                    reason="user_rate_limit",
+                    retry_after_seconds=max(retry_after, 1),
+                )
+
+            bucket.append(now)
+            daily.append(now)
+            return ThrottleDecision(allowed=True)
+
     @staticmethod
     def _prune(bucket: deque[float], now: float, window: float) -> deque[float]:
         while bucket and now - bucket[0] >= window:

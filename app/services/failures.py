@@ -26,8 +26,14 @@ from app.domain.errors import (
     LLMTimeoutError,
     MessageTooLongError,
     PersistenceError,
+    PlanningInputError,
     RateLimitedError,
+    ResearchDeadlineError,
     ResearchError,
+    ResearchNoEvidenceError,
+    ResearchPipelineError,
+    SearchNoResultsError,
+    SynthesisInputError,
 )
 
 GENERIC = "Something went wrong. Please try again."
@@ -51,6 +57,40 @@ MESSAGES: dict[type[ResearchError], str] = {
     MessageTooLongError: "That message is too long for me to handle. Please shorten it.",
     ConversationNotFoundError: "There is no conversation to do that with.",
     DeliveryError: "Could not send the response.",
+    # --- the research failure family (Phase 3, P3.9-D; FR-43, § 15.9) --------
+    #
+    # Four messages that are deliberately *different*: "I looked and found nothing
+    # I could stand behind" and "I could not finish looking" are not the same
+    # outcome, and neither is "your question was too long" or "I ran out of time".
+    # The audit § R.10 records that all four used to converge on one message, and
+    # § B5-P4 makes telling them apart a prerequisite of the deadline policy.
+    #
+    # Each is stated in the same shape the chat messages already use — plain,
+    # actionable, and free of provider text, URLs, identifiers, and stage names.
+    # No message discloses how many sources were tried, which provider failed, or
+    # why a citation did not verify.
+    ResearchNoEvidenceError: (
+        "I could not find enough reliable information to answer that. "
+        "Try rephrasing the question or asking about something else."
+    ),
+    SearchNoResultsError: (
+        "I could not find anything about that. Try rephrasing the question."
+    ),
+    SynthesisInputError: (
+        "I found sources but nothing in them supported an answer with citations. "
+        "Try rephrasing the question."
+    ),
+    ResearchDeadlineError: (
+        "The research took longer than I have, so I stopped early. "
+        "Please try again with a more specific question."
+    ),
+    ResearchPipelineError: (
+        "I could not complete that research. Please try again shortly."
+    ),
+    PlanningInputError: (
+        "That research question is empty or too long for me to handle. "
+        "Please keep it under the configured limit and try again."
+    ),
 }
 
 #: Failures that are the user's own fault or the platform's, where retrying the

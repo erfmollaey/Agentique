@@ -186,7 +186,10 @@ def _truncate(database: Database) -> None:
         async with database.engine.begin() as connection:
             await connection.execute(text("SET LOCAL lock_timeout = '5s'"))
             await connection.execute(
-                text("TRUNCATE messages, conversations, users RESTART IDENTITY CASCADE")
+                text(
+                    "TRUNCATE citations, claims, source_chunks, sources, research_runs, "
+                    "messages, conversations, users RESTART IDENTITY CASCADE"
+                )
             )
 
     run_on_process_loop(wipe())
@@ -245,6 +248,23 @@ def settings() -> Settings:
         MAX_IN_FLIGHT_REQUESTS=2,
         LOG_LEVEL="WARNING",
     )
+
+
+@pytest.fixture
+def make_settings(settings):
+    """A builder for settings with selected fields overridden.
+
+    Phase 3's fetch stage bounds everything it does with configuration — byte
+    caps, timeouts, redirect depth — so several of its tests are about what
+    happens at a *different* limit. Overriding the whole object per test would
+    duplicate every unrelated field and let the two copies drift; overriding named
+    fields on the shared fixture cannot.
+    """
+
+    def build(**overrides: object) -> Settings:
+        return settings.model_copy(update=overrides)
+
+    return build
 
 
 class FakeLLMClient:

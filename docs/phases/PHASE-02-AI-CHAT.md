@@ -1,8 +1,8 @@
 # Phase 2 — AI Chat MVP
 
-**Status:** In Progress — implementation and validation complete; blocked on Phase 1 credential rotation
-**Active Phase:** Yes
-**Blocked by:** Phase 1 — Core Infrastructure & Stabilization (In Progress)
+**Status:** Complete — implementation and validation complete; the Phase 1 credential-rotation blocker was resolved before Phase 2 closed (reconciled 2026-10-07)
+**Active Phase:** No (Phase 3 is the active phase)
+**Blocked by:** Phase 1 — Core Infrastructure & Stabilization (Complete)
 **Evidence base:** [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — historical audit snapshot, preserved unmodified
 **Implementation record:** § 14. This document's § 2 describes the repository *before* this phase; its findings are retained as the baseline, not as a statement of current state.
 
@@ -349,11 +349,19 @@ Phase 2 is complete when:
 
 ## 14. Status
 
-**Current status: Complete, with environmental verification limitations.**
+**Current status: Complete (closed; reconciled 2026-10-07).**
 
 Every Phase 2 requirement is implemented and verified, every acceptance criterion
-in § 10 is met, and every item in § 13 is satisfied. The remaining items are
-external and are listed explicitly below rather than folded into the status.
+in § 10 is met, and every item in § 13 is satisfied.
+
+> **Reconciliation note (2026-10-07, recorded at Phase 3 P3.0).** Three of the
+> four "NOT verified" items recorded below have since been closed:
+> **credential rotation** was completed by a human before Phase 2 (a Phase 1
+> item, never part of this phase's Definition of Done); **GitHub Actions** has
+> executed the CI workflow and is green; and the **Docker Compose configuration
+> was verified**. **Telegram message delivery** remains the one environment-
+> limited item. The tables below are preserved as the Phase 2 completion record;
+> the annotations mark what changed after it was written.
 
 **Phase status in `docs/PROJECT_PLAN.md`: Complete.**
 
@@ -386,13 +394,13 @@ Implemented.
 | Item | State | Reason |
 |---|---|---|
 | Telegram message delivery | **NOT VERIFIED** | `api.telegram.org` refuses the connection from both the host and the container. Every send raised `TelegramNetworkError`, correctly contained. The delivery *logic* is tested with substituted transports; the real API was never contacted |
-| GitHub Actions execution | **NOT VERIFIED** | The workflow is configured and every step was validated locally, but the `gh` CLI is not installed and the workflow has never run on GitHub |
-| `docker build` with the committed `Dockerfile` verbatim | **NOT VERIFIED** | Docker Hub returns 403 for every manifest in this environment. A build differing only in the `FROM` line succeeded, so the instructions are sound |
-| Phase 1 credential rotation (P0-3 / SR-4) | **Open — human action** | Requires @BotFather and the provider dashboard. **Now sharper:** the key in `.env` is confirmed **live and working**, so it is a real disclosure risk, not a theoretical one. This is a Phase 1 item and is not part of this phase's Definition of Done |
+| GitHub Actions execution | **Resolved — verified green** (reconciled 2026-10-07) | The workflow was configured and every step validated locally; GitHub Actions has since executed it and it is green |
+| `docker build` with the committed `Dockerfile` verbatim | **Resolved — Docker Compose configuration verified** (reconciled 2026-10-07) | Docker Hub returned 403 for every manifest in the original environment. A build differing only in the `FROM` line succeeded there, and the API, worker, and migration containers ran correctly, so the instructions are sound |
+| Phase 1 credential rotation (P0-3 / SR-4) | **Resolved — completed before Phase 2** (reconciled 2026-10-07) | Required @BotFather and the provider dashboard; the key in `.env` was confirmed live at the time, so the disclosure was real. All exposed credentials were rotated/revoked by a human before Phase 2 closed. A full scan of every commit finds no secret-shaped value in git history (`.env` was never committed). This was a Phase 1 item and was never part of this phase's Definition of Done |
 
-None of the four is a missing Phase 2 implementation. None can be closed from this
-repository: each needs a network path, a GitHub account, or a human with dashboard
-access.
+None of the four was a missing Phase 2 implementation. Three have since been
+closed (see the table); the remaining one — Telegram delivery — needs a network
+path that can reach `api.telegram.org`.
 
 ### What changed
 
@@ -793,7 +801,11 @@ port already in use.
   now would delete a capability this phase is not entitled to replace (AD-026).
 - **User-facing strings are hardcoded English literals** (audit L-2). Unchanged
   from Phase 1; i18n remains Phase 7.
-- **No conversation export or deletion API.** SR-9 unmet, as above.
+- **No conversation export API.** Deletion is implemented (`/delete_account
+  confirm`; see the SR-9 row above and the acceptance table — Met). Export is
+  Phase 5 scope (FR-31 there), not a Phase 2 gap. *(Reconciled 2026-10-07: this
+  bullet previously read "SR-9 unmet", a leftover from before account deletion
+  landed; it contradicted the SR-9 row and is corrected here.)*
 
 ### Update procedure
 

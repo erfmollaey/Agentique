@@ -115,7 +115,8 @@ async def test_start_command_is_answered(dispatcher, enqueued, sent):
 @pytest.mark.asyncio
 async def test_unknown_command_is_answered_not_enqueued(dispatcher, enqueued, sent):
     dp, bot = dispatcher
-    await _feed(dp, bot, _update(text="/research something"))
+    # `/research` is a real command since P3.9-D, so a still-unknown one is needed.
+    await _feed(dp, bot, _update(text="/doesnotexist something"))
 
     assert enqueued == [], "an unknown command was treated as free text"
     assert len(sent) == 1

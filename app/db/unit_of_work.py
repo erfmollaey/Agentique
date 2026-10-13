@@ -20,6 +20,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import Database
 from app.repositories.conversations import ConversationRepositoryImpl
 from app.repositories.messages import MessageRepositoryImpl
+from app.repositories.research import (
+    CitationRepositoryImpl,
+    ClaimRepositoryImpl,
+    ResearchRunRepositoryImpl,
+    SourceChunkRepositoryImpl,
+    SourceRepositoryImpl,
+)
 from app.repositories.users import UserRepositoryImpl
 
 log = logging.getLogger(__name__)
@@ -37,6 +44,11 @@ class SqlAlchemyUnitOfWork:
         self.users = UserRepositoryImpl(self._session)
         self.conversations = ConversationRepositoryImpl(self._session)
         self.messages = MessageRepositoryImpl(self._session)
+        self.research_runs = ResearchRunRepositoryImpl(self._session)
+        self.sources = SourceRepositoryImpl(self._session)
+        self.source_chunks = SourceChunkRepositoryImpl(self._session)
+        self.claims = ClaimRepositoryImpl(self._session)
+        self.citations = CitationRepositoryImpl(self._session)
         return self
 
     async def __aexit__(

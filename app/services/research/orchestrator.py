@@ -101,8 +101,14 @@ from app.domain.research.ports import (
 from app.domain.research.search import SafeSearchLevel, SearchRequest
 from app.domain.research.synthesis import SynthesizedAnswer
 from app.domain.research.types import ResearchRunStatus, Source, SourceRanking
+from app.services.formatting import telegram_chunk_limit
 from app.services.research.planning import PlanningService
 from app.services.research.synthesis import SynthesisService
+from app.services.research.usage import (
+    RunTokenLedger,
+    active_ledger,
+    token_scope,
+)
 
 log = logging.getLogger(__name__)
 
@@ -196,6 +202,13 @@ class ResearchOutcome(BaseModel):
     a verified answer is the only thing that may be delivered (§ 17). There is
     deliberately no field for model output that failed verification: an unvalidated
     citation must not be reachable as research output by any route (§ 16).
+
+    ``messages`` is the **delivery** form of the same answer (FR-40): the prose with
+    inline citation markers and a numbered source list, pre-split into messages that
+    are each already within Telegram's limit. It is populated only for an outcome that
+    has a verified answer, and it is rendered from the *same* verified citations the
+    stored answer carries — rendering adds presentation, never a reference. ``answer``
+    stays available so a non-Telegram caller has the prose without the apparatus.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -203,6 +216,7 @@ class ResearchOutcome(BaseModel):
     kind: RunOutcomeKind
     status: str
     answer: str | None = None
+    messages: tuple[str, ...] = ()
     summary: str = ""
 
     candidates: int = 0
@@ -333,14 +347,36 @@ class ResearchOrchestrator:
         question = run.question
 
         tallies = _Tallies()
-        plan = await self._planning.plan_for_run(run_id, user_id)
-        candidates = await self._gather(plan, run_id, user_id, tallies)
-        fetched = await self._retrieve(candidates, run_id, user_id, tallies)
-        selected_ids = await self._rank_and_persist(
-            fetched, run_id, user_id, tallies, question
-        )
-        await self._collect_evidence(selected_ids, run_id, user_id, tallies)
-        return await self._finish(run_id, user_id, tallies, question)
+        # FR-9/SR-5: one ledger per run. Every provider call made by the four research
+        # adapters inside this scope records its reported usage into it, and the
+        # terminal write persists the total. The scope covers every stage, so a run
+        # that fails part-way still accounts for what it spent rather than reporting
+        # zero. It is restored on exit, including on the exception path.
+        with token_scope() as tokens:
+            try:
+                plan = await self._planning.plan_for_run(run_id, user_id)
+                candidates = await self._gather(plan, run_id, user_id, tallies)
+                fetched = await self._retrieve(candidates, run_id, user_id, tallies)
+                selected_ids = await self._rank_and_persist(
+                    fetched, run_id, user_id, tallies, question
+                )
+                await self._collect_evidence(selected_ids, run_id, user_id, tallies)
+                return await self._finish(run_id, user_id, tallies, question, tokens)
+            except BaseException:
+                # Stated, not written. A classified pipeline failure persists its own
+                # usage in `_fail`; an interruption (a soft limit) or an unexpected
+                # error leaves the terminal row to the task layer, and the totals are
+                # logged here so an operator still sees what the run spent. Recording
+                # them through `set_status` from this handler would compete with the
+                # task's own terminal write for the same row and its lifecycle lock.
+                if tokens.has_usage:
+                    log.warning(
+                        "research run ended without its token ledger persisted: "
+                        "run=%d prompt=%d completion=%d calls=%d",
+                        run_id, tokens.prompt_tokens, tokens.completion_tokens,
+                        tokens.calls,
+                    )
+                raise
 
     # --- stage 1: claim -----------------------------------------------------
 
@@ -1063,7 +1099,12 @@ class ResearchOrchestrator:
     # --- stage 7 + 8: synthesis and the terminal outcome ---------------------
 
     async def _finish(
-        self, run_id: int, user_id: int, tallies: _Tallies, question: str
+        self,
+        run_id: int,
+        user_id: int,
+        tallies: _Tallies,
+        question: str,
+        tokens: RunTokenLedger | None = None,
     ) -> ResearchOutcome:
         """Synthesize the answer, or classify why there is none (AD-044, § R.17).
 
@@ -1103,7 +1144,7 @@ class ResearchOrchestrator:
 
         try:
             outcome = await self._synthesis.synthesize_run(
-                run_id=run_id, user_id=user_id, terminal_status=terminal
+                run_id=run_id, user_id=user_id, terminal_status=terminal, tokens=tokens
             )
         except SynthesisInputError as exc:
             # No verified evidence anywhere: nothing was retrieved, every source
@@ -1133,6 +1174,39 @@ class ResearchOrchestrator:
             answer=answer,
         )
 
+    def _render(self, answer: SynthesizedAnswer) -> tuple[str, ...]:
+        """Render a verified answer for delivery (FR-40).
+
+        Delegates to :mod:`app.services.research.rendering`, which verifies nothing
+        and invents nothing — it renders the citations synthesis already accepted.
+
+        A rendering failure falls back to the plain prose rather than propagating.
+        The reasoning is that the two failure modes are not comparable: a refusal
+        from synthesis means *the citations did not resolve*, and withholding the
+        answer is correct; a failure here means *the reference list could not be
+        formatted*, and discarding a verified, evidence-backed answer because of a
+        presentation defect would trade a correct result for an empty one. The
+        fallback is logged at warning level so the defect is visible rather than
+        silent, and the delivered text then carries no source list — which is why the
+        renderer never emits a marker it cannot also list.
+        """
+        from app.services.research.rendering import render_answer
+
+        try:
+            rendered = render_answer(
+                answer,
+                limit=telegram_chunk_limit(
+                    self._settings.TELEGRAM_MAX_MESSAGE_LENGTH
+                ),
+            )
+        except Exception:
+            log.warning(
+                "citation rendering failed; delivering the verified answer as prose",
+                exc_info=True,
+            )
+            return ()
+        return rendered.messages
+
     def _outcome(
         self,
         kind: RunOutcomeKind,
@@ -1141,11 +1215,27 @@ class ResearchOrchestrator:
         answer: SynthesizedAnswer | None = None,
         summary: str | None = None,
     ) -> ResearchOutcome:
-        """Fold the run's counters into the value a caller delivers exactly once."""
+        """Fold the run's counters into the value a caller delivers exactly once.
+
+        ``answer`` is rendered here (FR-40) and only here, so the delivered form and
+        the stored form cannot diverge: both come from the one verified object the
+        synthesis stage produced. Rendering happens after verification has already
+        succeeded, so a failure to render is a presentation defect rather than an
+        integrity one — and an answer that cannot be rendered is still delivered as
+        plain prose rather than withheld, because a formatting problem must not
+        destroy a verified result.
+        """
+        messages: tuple[str, ...] = ()
+        answer_text: str | None = None
+        if answer is not None:
+            answer_text = answer.plain_text
+            messages = self._render(answer)
+
         return ResearchOutcome(
             kind=kind,
             status=kind.run_status(),
-            answer=answer.plain_text if answer is not None else None,
+            answer=answer_text,
+            messages=messages,
             summary=summary
             if summary is not None
             else summarize_run(
@@ -1219,7 +1309,15 @@ class ResearchOrchestrator:
         never the exception's own text, which can contain a provider message, a SQL
         fragment, or a URL (SR-7, FR-42). The exception's type is used for the log
         line and for the classification the task layer reads; neither reaches a user.
+
+        It also persists what the run spent (FR-9, SR-5), read from the ledger
+        ``execute`` opened for this run. A failed run's cost is precisely what an
+        operator most needs to see, and it would otherwise be recorded nowhere: there
+        is no answer, so there is no synthesis write to carry the numbers. The values
+        are **set**, not incremented, so a repeated terminal write converges rather
+        than accumulating (FR-9).
         """
+        tokens = active_ledger() or RunTokenLedger()
         log.warning(
             "research failed: run=%d kind=%s reason=%s error=%s",
             run_id,
@@ -1233,7 +1331,15 @@ class ResearchOrchestrator:
                 user_id,
                 "failed",
                 failure_summary=self._failure_summary(kind, tallies, reason),
+                prompt_tokens=tokens.prompt_tokens,
+                completion_tokens=tokens.completion_tokens,
             )
+        log.info(
+            "research run usage recorded: run=%d prompt=%d completion=%d calls=%d "
+            "without_usage=%d",
+            run_id, tokens.prompt_tokens, tokens.completion_tokens,
+            tokens.calls, tokens.calls_without_usage,
+        )
 
     def _failure_summary(
         self, kind: RunOutcomeKind, tallies: _Tallies, reason: str

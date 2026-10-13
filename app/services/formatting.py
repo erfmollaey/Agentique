@@ -68,6 +68,17 @@ def split_for_telegram(text: str, limit: int = _SAFE_CHUNK) -> list[str]:
     return _chunk(text, limit)
 
 
+def telegram_chunk_limit(configured_limit: int) -> int:
+    """The per-message character budget delivery will actually apply.
+
+    One definition, two callers: :class:`app.services.delivery.DeliveryService`
+    splits on it, and the research renderer pre-splits to it so a rendered answer is
+    not split twice. Keeping it here is what stops the two from drifting apart and
+    silently re-chunking a message whose citation markers were deliberately placed.
+    """
+    return min(configured_limit, TELEGRAM_HARD_LIMIT) - 16
+
+
 def render_analysis(
     summary: str,
     sub_questions: Iterable[str],

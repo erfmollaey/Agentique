@@ -8,6 +8,22 @@ through the ORM or ``sqlalchemy`` expressions, never by string concatenation
 
 from app.repositories.conversations import ConversationRepositoryImpl
 from app.repositories.messages import MessageRepositoryImpl
+from app.repositories.research import (
+    CitationRepositoryImpl,
+    ClaimRepositoryImpl,
+    ResearchRunRepositoryImpl,
+    SourceChunkRepositoryImpl,
+    SourceRepositoryImpl,
+)
 from app.repositories.users import UserRepositoryImpl
 
-__all__ = ["ConversationRepositoryImpl", "MessageRepositoryImpl", "UserRepositoryImpl"]
+__all__ = [
+    "CitationRepositoryImpl",
+    "ClaimRepositoryImpl",
+    "ConversationRepositoryImpl",
+    "MessageRepositoryImpl",
+    "ResearchRunRepositoryImpl",
+    "SourceChunkRepositoryImpl",
+    "SourceRepositoryImpl",
+    "UserRepositoryImpl",
+]

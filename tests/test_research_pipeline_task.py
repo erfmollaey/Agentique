@@ -70,17 +70,39 @@ class _Orchestrator:
         return self._result
 
 
+#: What the orchestrator hands the task for a run with two verified sources: the
+#: answer with its inline markers, then the reference list, already split for
+#: Telegram (FR-40).
+_ANSWER_MESSAGES = (
+    "The 2024 survey recorded growth. [1]\n\n",
+    "Sources:\n[1] Field survey 2024 — example.com (chunk 3)\n"
+    "https://example.com/survey\n",
+    "[2] Statistical annex — stats.example.org\nhttps://stats.example.org/table",
+)
+
+
 def _answered() -> ResearchOutcome:
     return ResearchOutcome(
         kind=RunOutcomeKind.COMPLETED,
         status="completed",
         answer="The 2024 survey recorded growth.",
+        messages=_ANSWER_MESSAGES,
         candidates=3,
         fetched=3,
         extracted=3,
         selected=2,
         claims=4,
         citations=4,
+        synthesized=True,
+    )
+
+
+def _answered_without_rendering() -> ResearchOutcome:
+    """A run whose rendering fell back to prose carries no ``messages``."""
+    return ResearchOutcome(
+        kind=RunOutcomeKind.COMPLETED,
+        status="completed",
+        answer="The 2024 survey recorded growth.",
         synthesized=True,
     )
 
@@ -105,14 +127,60 @@ def worker(monkeypatch, settings):
 
 
 def test_a_completed_run_sends_exactly_one_message(monkeypatch, settings):
+    """The single-part path: a short answer is one Telegram message, not several."""
     bot = LoopBoundBot()
-    orchestrator = _Orchestrator(result=_answered())
+    orchestrator = _Orchestrator(result=_answered_without_rendering())
     _container(settings, orchestrator, bot, monkeypatch)
 
     _invoke(run_id=7, user_id=3, chat_id=99)
 
     assert len(bot.sent) == 1
     assert bot.sent[0][0] == 99
+    assert bot.sent[0][1] == "The 2024 survey recorded growth."
+
+
+def test_a_completed_run_sends_its_rendered_parts_in_order(monkeypatch, settings):
+    """FR-40: the answer's markers and its source list both reach the user.
+
+    One logical terminal message, pre-split by the renderer. Every part is sent, in
+    order, exactly once — a long cited answer arrives whole instead of being cut off
+    at Telegram's limit with its references missing.
+    """
+    bot = LoopBoundBot()
+    _container(settings, _Orchestrator(result=_answered()), bot, monkeypatch)
+
+    _invoke(run_id=7, user_id=3, chat_id=99)
+
+    assert [text for _chat, text in bot.sent] == list(_ANSWER_MESSAGES)
+    assert all(chat == 99 for chat, _text in bot.sent)
+
+
+def test_the_delivered_answer_carries_a_marker_and_its_source(monkeypatch, settings):
+    """The product promise: a cited answer, not prose with no references."""
+    bot = LoopBoundBot()
+    _container(settings, _Orchestrator(result=_answered()), bot, monkeypatch)
+
+    _invoke(run_id=7, user_id=3, chat_id=99)
+
+    joined = "\n".join(text for _chat, text in bot.sent)
+    assert "[1]" in joined
+    assert "https://example.com/survey" in joined
+
+
+def test_a_run_whose_rendering_fell_back_delivers_the_plain_answer(monkeypatch, settings):
+    """A presentation defect must not cost the user a verified result.
+
+    The renderer refuses rather than emitting a reference it cannot make honest, and
+    the orchestrator then falls back to prose. The answer still arrives.
+    """
+    bot = LoopBoundBot()
+    _container(
+        settings, _Orchestrator(result=_answered_without_rendering()), bot, monkeypatch
+    )
+
+    _invoke(run_id=7, user_id=3, chat_id=99)
+
+    assert len(bot.sent) == 1
     assert bot.sent[0][1] == "The 2024 survey recorded growth."
 
 
@@ -162,15 +230,17 @@ def test_a_redelivery_of_a_terminal_run_never_reaches_the_orchestrator(
     _container(settings, orchestrator, bot, monkeypatch)
 
     _invoke(run_id=7, user_id=3, chat_id=99)
-    assert len(bot.sent) == 1
+    parts = len(_ANSWER_MESSAGES)
+    assert len(bot.sent) == parts
 
     # A redelivery is driven through the same task entry point.
     _invoke(run_id=7, user_id=3, chat_id=99)
 
-    assert len(bot.sent) == 2, (
+    assert len(bot.sent) == 2 * parts, (
         "the task body runs again on a redelivery; it is the orchestrator's terminal "
         "check that prevents the second logical execution, and this double does not "
-        "model it"
+        "model it. One execution sends the rendered answer as `parts` messages, so a "
+        "second execution doubles the count rather than adding one."
     )
 
 

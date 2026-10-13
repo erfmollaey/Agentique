@@ -191,7 +191,13 @@ class OpenAICompatibleClient:
             error.retryable = False
             raise error from exc
         except APIConnectionError as exc:
-            log.warning("AI provider unreachable")
+            # The class name is the only part of the exception that is safe to
+            # log: it distinguishes a DNS refusal, a TLS failure, and a reset
+            # mid-response from each other, which the *message* this handler
+            # raises collapses into one string (SR-5, and the Run 18 gap where
+            # three retryable failures were indistinguishable in the log).
+            # The provider's own text is never emitted here either.
+            log.warning("AI provider unreachable: %s", type(exc).__name__)
             raise LLMServiceError("AI provider unreachable") from exc
         except Exception as exc:
             log.exception("unexpected AI provider error")
@@ -235,7 +241,9 @@ class OpenAICompatibleClient:
             error.retryable = False
             raise error from exc
         except APIConnectionError as exc:
-            log.warning("AI provider unreachable")
+            # Same contract as _call: the class name and nothing else. See the
+            # note there for why the class name is the safe diagnostic.
+            log.warning("AI provider unreachable: %s", type(exc).__name__)
             raise LLMServiceError("AI provider unreachable") from exc
         except Exception as exc:
             log.exception("unexpected AI provider error")

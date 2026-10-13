@@ -38,6 +38,7 @@ from app.db.models import (
 )
 from app.db.unit_of_work import SqlAlchemyUnitOfWork
 from app.domain.errors import SearchNoResultsError
+from app.domain.research.lifecycle import TransitionError
 from app.domain.research.outcome import CooperativeDeadline, RunOutcomeKind
 
 #: A quote that is a literal substring of ``ENGLISH_PASSAGE``.
@@ -52,6 +53,7 @@ from app.services.research.evidence import SourceEvidenceService
 from app.services.research.orchestrator import ResearchOrchestrator
 from app.services.research.planning import PlanningService
 from app.services.research.synthesis import SynthesisService
+from app.services.research.usage import UsageRecordingLLM
 from tests.conftest import run_on_process_loop
 from tests.research_support import (
     ENGLISH_PASSAGE,
@@ -116,17 +118,30 @@ class FetchAdapter:
 
 
 class ExtractAdapter:
-    """A ``ContentExtraction`` producing the text the test wants."""
+    """A ``ContentExtraction`` producing the text the test wants.
 
-    def __init__(self, text: str = ENGLISH_PASSAGE) -> None:
+    ``per_source`` varies the text by source id. Content-hash deduplication collapses
+    sources whose *extracted* text is identical (FR-25, the property that keeps a
+    shared boilerplate banner from merging two real articles), so a test that needs
+    two sources to survive selection must give them two different texts — otherwise it
+    is testing the deduplicator, not the stage it meant to exercise.
+    """
+
+    def __init__(self, text: str = ENGLISH_PASSAGE, *, per_source: bool = False) -> None:
         self.text = text
+        self.per_source = per_source
         self.calls = 0
 
     async def extract(self, source: Any) -> Any:
         from app.domain.research.extraction import ExtractedContent
 
         self.calls += 1
-        return ExtractedContent.from_fetched(source, text=self.text)
+        text = (
+            f"{self.text} Reference {self.calls}."
+            if self.per_source
+            else self.text
+        )
+        return ExtractedContent.from_fetched(source, text=text)
 
 
 class Deduplicator:
@@ -178,13 +193,15 @@ class EvidenceAdapter:
                 source_id=source_id,
                 summary=SourceSummary(source_id=source_id, text="A controlled summary."),
             )
-        llm = RecordingLLM(
-            [
-                json.dumps({"summary": "A controlled summary.", "language": "en"}),
-                claims_response(
-                    claim("The survey recorded growth.", chunks[0], self.quote)
-                ),
-            ]
+        llm = UsageRecordingLLM(
+            RecordingLLM(
+                [
+                    json.dumps({"summary": "A controlled summary.", "language": "en"}),
+                    claims_response(
+                        claim("The survey recorded growth.", chunks[0], self.quote)
+                    ),
+                ]
+            )
         )
         settings = self.settings
         return await SourceEvidenceService(
@@ -216,7 +233,14 @@ async def _passages_of(database, source_id: int) -> list[int]:
 
 
 class SynthesisAdapter:
-    """A ``SynthesisProvider`` returning one canned proposal."""
+    """A ``SynthesisProvider`` returning one canned proposal.
+
+    It cites the **first citation of the run it was actually shown**, taken from the
+    registry rather than hard-coded. A fixed ``1`` happens to be right for the first
+    run against a freshly truncated database and wrong for every run after it, so a
+    double that could only be used once hid the difference between "the pipeline
+    works" and "the harness guessed the id".
+    """
 
     def __init__(self, text: str = "The 2024 survey recorded growth.") -> None:
         self.text = text
@@ -227,11 +251,13 @@ class SynthesisAdapter:
         from app.infrastructure.synthesis.synthesizer import _parse_object
 
         self.inputs.append(synthesis_input)
+        entries = synthesis_input.registry.entries
+        citation_ids = [entries[0].citation_id] if entries else []
         return SynthesisProposal.from_payload(_parse_object(json.dumps(
             {
                 "schema_version": _SYNTHESIS_SCHEMA_VERSION,
                 "sections": [
-                    {"text": self.text, "citation_ids": [1]},
+                    {"text": self.text, "citation_ids": citation_ids},
                 ],
             }
         )))
@@ -305,12 +331,16 @@ class Pipeline:
     def _build(self) -> ResearchOrchestrator:
         factory = _uow_factory(self.database)
         settings = self.settings
+        # The composition root hands the four research adapters the shared provider
+        # behind ``UsageRecordingLLM`` (FR-9/SR-5), so the harness does the same and
+        # the accounting under test runs over the same wiring production runs.
+        llm = UsageRecordingLLM(self.llm)
         return ResearchOrchestrator(
             settings=settings,
             uow_factory=factory,
             planning=PlanningService(
                 settings=settings,
-                planner=LLMPlanner(self.llm, settings),
+                planner=LLMPlanner(llm, settings),
                 uow_factory=factory,
             ),
             search_provider=self.search,
@@ -457,9 +487,30 @@ class _NoEvidenceService:
 
     async def analyze_source(self, *, run_id: int, user_id: int, source_id: int) -> Any:
         self.calls.append((run_id, user_id, source_id))
-        from app.domain.research.evidence import SourceEvidenceResult
+        from app.domain.research.evidence import SourceEvidenceResult, SourceSummary
 
-        return SourceEvidenceResult(source_id=source_id)
+        # A summary and no claims: the source was read, but nothing in it survived
+        # claim extraction, so synthesis has no citable evidence (FR-41).
+        return SourceEvidenceResult(
+            source_id=source_id,
+            summary=SourceSummary(source_id=source_id, text="Nothing verifiable."),
+        )
+
+
+def _rewrite_terminal(database, run_id: int, user_id: int, prompt: int, completion: int):
+    """Write the same ledger totals again through the lifecycle's own interface."""
+
+    async def _do() -> None:
+        async with SqlAlchemyUnitOfWork(database) as uow:
+            await uow.research_runs.set_status(
+                run_id,
+                user_id,
+                "completed",
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+            )
+
+    return _do()
 
 
 # --- the § R.7 minimum integration test -------------------------------------
@@ -554,6 +605,147 @@ class TestIntegrationPath:
         passages = pipeline.passages_by_id()
         for citation in pipeline.citations():
             assert str(citation["quote"]) in passages[int(citation["chunk_id"])]
+
+
+class TestTokenAccounting:
+    """FR-9 / SR-5 / T-25: a run records what its own model calls cost.
+
+    Before this, ``research_runs.prompt_tokens`` / ``completion_tokens`` had columns
+    the repository would write and no caller that ever passed a value, so every run
+    reported zero regardless of how much it had spent.
+
+    ``RecordingLLM`` reports ``prompt_tokens=11, completion_tokens=7`` per call, so the
+    persisted totals are a function of the call count and the assertion can be exact
+    rather than "greater than zero".
+    """
+
+    #: One planning call plus one summarization and one claim-extraction call per
+    #: source. ``SynthesisAdapter`` is a double and does not call the provider, so it
+    #: contributes nothing to the ledger — which is itself part of what is asserted.
+    def _pipeline(self, database, settings, *, sources: int = 1) -> Pipeline:
+        return Pipeline(
+            database,
+            settings,
+            search=SearchAdapter(
+                [result(f"https://example.com/{n}", n) for n in range(1, sources + 1)]
+            ),
+            fetch=FetchAdapter(),
+            # Distinct text per source, so content-hash dedup does not collapse them
+            # and the second source really reaches the evidence stage.
+            extract=ExtractAdapter(ENGLISH_PASSAGE, per_source=sources > 1),
+            llm_replies=[plan_reply()],
+            evidence_factory=lambda: EvidenceAdapter(database, settings, QUOTE),
+        )
+
+    def test_a_completed_run_persists_the_usage_its_calls_reported(
+        self, clean_database, settings
+    ):
+        pipeline = self._pipeline(clean_database, settings)
+        user_id, run_id = pipeline.seed()
+
+        outcome = pipeline.run(run_id, user_id)
+        assert outcome.kind is RunOutcomeKind.COMPLETED
+
+        # One planning call, plus one summarization and one claim-extraction call for
+        # the single source. Each reports 11 prompt / 7 completion tokens.
+        calls = 3
+        row = pipeline.run_row(run_id)
+        assert row.prompt_tokens == 11 * calls
+        assert row.completion_tokens == 7 * calls
+        assert row.prompt_tokens > 0 and row.completion_tokens > 0
+
+    def test_several_model_calls_accumulate_rather_than_overwrite(
+        self, clean_database, settings
+    ):
+        """Two sources means more provider calls, and the ledger must add up.
+
+        The values are **set**, not incremented, so the second run reports its own
+        total rather than either overwriting the first or accumulating onto it.
+        """
+        one = self._pipeline(clean_database, settings, sources=1)
+        user_id, run_id = one.seed(user_id=6101)
+        one.run(run_id, user_id)
+        first = one.run_row(run_id)
+
+        two = self._pipeline(clean_database, settings, sources=2)
+        other_user, other_run = two.seed(user_id=6102)
+        two.run(other_run, other_user)
+        second = two.run_row(other_run)
+
+        # 1 source → 1 planning + 2 per source = 3.  2 sources → 1 + 4 = 5.
+        assert first.prompt_tokens == 11 * 3
+        assert second.prompt_tokens == 11 * 5
+        assert second.prompt_tokens > first.prompt_tokens
+        assert second.completion_tokens == 7 * 5
+
+    def test_a_repeated_terminal_write_is_refused_so_the_ledger_cannot_double_count(
+        self, clean_database, settings
+    ):
+        """Double counting is prevented by the lifecycle, not by arithmetic.
+
+        ``set_status`` *sets* the ledger columns rather than incrementing them, and
+        the lifecycle separately refuses a terminal run being rewritten. Both hold:
+        a Celery retry that re-executed the terminal write would be refused outright,
+        and a caller that could reach the write at all would overwrite rather than
+        add. The DoD-§ 13 property protecting a terminal run from being reopened is
+        not relaxed to accommodate bookkeeping.
+        """
+        pipeline = self._pipeline(clean_database, settings)
+        user_id, run_id = pipeline.seed()
+        pipeline.run(run_id, user_id)
+        before = pipeline.run_row(run_id)
+
+        with pytest.raises(TransitionError):
+            run_on_process_loop(
+                _rewrite_terminal(
+                    clean_database, run_id, user_id,
+                    before.prompt_tokens, before.completion_tokens,
+                )
+            )
+
+        after = pipeline.run_row(run_id)
+        assert after.prompt_tokens == before.prompt_tokens
+        assert after.completion_tokens == before.completion_tokens
+
+    def test_a_run_with_no_evidence_still_records_what_it_spent(
+        self, clean_database, settings
+    ):
+        """A failed run's cost is what an operator most needs to see.
+
+        There is no answer, so there is no synthesis write to carry the numbers; the
+        terminal failure write carries them instead.
+        """
+        pipeline = Pipeline(
+            clean_database,
+            settings,
+            search=SearchAdapter([result("https://example.com/a", 1)]),
+            fetch=FetchAdapter(),
+            extract=ExtractAdapter(ENGLISH_PASSAGE),
+            llm_replies=[plan_reply()],
+            evidence_factory=None,  # no claims, so synthesis has nothing to cite
+        )
+        user_id, run_id = pipeline.seed()
+
+        outcome = pipeline.run(run_id, user_id)
+        assert outcome.kind is RunOutcomeKind.NO_EVIDENCE
+
+        row = pipeline.run_row(run_id)
+        assert row.status == "failed"
+        assert row.prompt_tokens == 11  # the planning call
+        assert row.completion_tokens == 7
+
+    def test_the_usage_is_written_without_moving_the_status(
+        self, clean_database, settings
+    ):
+        """The ledger rides along with the terminal write, never replacing it."""
+        pipeline = self._pipeline(clean_database, settings)
+        user_id, run_id = pipeline.seed()
+        pipeline.run(run_id, user_id)
+
+        row = pipeline.run_row(run_id)
+        assert row.status == "completed"
+        assert row.final_answer, "usage accounting displaced the answer"
+        assert row.prompt_tokens > 0
 
 
 class TestTheClaimIsIdempotent:

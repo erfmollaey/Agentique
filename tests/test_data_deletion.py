@@ -19,7 +19,16 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import func, select
 
-from app.db.models import ConversationModel, MessageModel, UserModel
+from app.db.models import (
+    CitationModel,
+    ClaimModel,
+    ConversationModel,
+    MessageModel,
+    ResearchRunModel,
+    SourceChunkModel,
+    SourceModel,
+    UserModel,
+)
 from app.db.unit_of_work import SqlAlchemyUnitOfWork
 from app.domain.chat import Role
 from app.domain.errors import PersistenceError
@@ -334,6 +343,154 @@ def test_deleting_an_unknown_identity_is_a_no_op(populated):
     assert result.deleted is False
     assert result.conversations == 0 and result.messages == 0
     assert _counts(database) == before, "a no-op delete changed something"
+
+
+# --- Research artifacts in the cascade (P3.1, AD-034) -----------------------
+#
+# The Phase 2 tree is extended: deleting a user must also remove every
+# research run, source, source chunk, claim, and citation owned by that user.
+# Verified against real PostgreSQL with real commits, the same way as the
+# conversation/message tree above.
+
+
+@pytest.fixture
+def populated_with_research(clean_database):
+    """Two users, each with a conversation, messages, and a full research tree."""
+    database = clean_database
+    _seed_database(database, 700, "owner")
+    _seed_database(database, 701, "other")
+    _seed_research(database, 700)
+    _seed_research(database, 701)
+    return database
+
+
+def _seed_research(database, telegram_user_id):
+    async def seed():
+        from sqlalchemy import select
+
+        from app.db.models import UserModel
+        from app.repositories.research import (
+            CitationRepositoryImpl,
+            ClaimRepositoryImpl,
+            ResearchRunRepositoryImpl,
+            SourceChunkRepositoryImpl,
+            SourceRepositoryImpl,
+        )
+
+        async with SqlAlchemyUnitOfWork(database) as uow:
+            user = (
+                await uow._session.execute(
+                    select(UserModel).where(UserModel.telegram_user_id == telegram_user_id)
+                )
+            ).scalar_one()
+            runs = ResearchRunRepositoryImpl(uow._session)
+            sources = SourceRepositoryImpl(uow._session)
+            chunks = SourceChunkRepositoryImpl(uow._session)
+            claims = ClaimRepositoryImpl(uow._session)
+            citations = CitationRepositoryImpl(uow._session)
+
+            run = await runs.create(user.id, f"question for {telegram_user_id}")
+            source = await sources.add(run.id, "https://example.com/a", "example.com")
+            chunk = await chunks.add(source.id, 0, "passage", 0, 7)
+            claim = await claims.add(run.id, "claim")
+            await citations.add(claim.id, source.id, chunk.id, "passage")
+
+    _run(seed())
+
+
+def _research_counts(database):
+    async def query():
+        counts = {}
+        async with SqlAlchemyUnitOfWork(database) as uow:
+            for name, model in (
+                ("research_runs", ResearchRunModel),
+                ("sources", SourceModel),
+                ("source_chunks", SourceChunkModel),
+                ("claims", ClaimModel),
+                ("citations", CitationModel),
+            ):
+                counts[name] = int(
+                    (
+                        await uow._session.execute(select(func.count()).select_from(model))
+                    ).scalar_one()
+                )
+        return counts
+
+    return _run(query())
+
+
+def test_account_deletion_removes_the_whole_research_tree(populated_with_research):
+    """AD-034: the /delete_account cascade must cover every research artifact."""
+    database = populated_with_research
+    assert _research_counts(database) == {
+        "research_runs": 2,
+        "sources": 2,
+        "source_chunks": 2,
+        "claims": 2,
+        "citations": 2,
+    }
+
+    _run(_delete_via_repository(database, 700))
+
+    assert _user_row(database, 700) is None
+    assert _research_counts(database) == {
+        "research_runs": 1,
+        "sources": 1,
+        "source_chunks": 1,
+        "claims": 1,
+        "citations": 1,
+    }
+    # The Phase 2 semantics still hold for the same deletion.
+    assert _counts(database) == {"users": 1, "conversations": 1, "messages": 3}
+
+
+def test_account_deletion_leaves_another_users_research_intact(populated_with_research):
+    """SR-10 continuity: no cross-user deletion of research artifacts."""
+    database = populated_with_research
+    other = _user_row(database, 701)
+
+    _run(_delete_via_repository(database, 700))
+
+    assert _user_row(database, 701) is not None
+    assert _research_counts(database) == {
+        "research_runs": 1,
+        "sources": 1,
+        "source_chunks": 1,
+        "claims": 1,
+        "citations": 1,
+    }
+
+    async def surviving_run_owner():
+        async with SqlAlchemyUnitOfWork(database) as uow:
+            row = (await uow._session.execute(select(ResearchRunModel))).scalar_one()
+            return row.user_id
+
+    assert _run(surviving_run_owner()) == other.id
+
+
+def test_a_failed_deletion_rolls_back_the_research_tree(populated_with_research, monkeypatch):
+    """Transactional: a mid-deletion failure leaves no partial research deletion."""
+    from app.repositories.users import UserRepositoryImpl
+
+    database = populated_with_research
+    before = _research_counts(database)
+
+    original = UserRepositoryImpl.delete
+
+    async def delete_then_fail(self, telegram_user_id):
+        await original(self, telegram_user_id)
+        raise PersistenceError("commit failed after the delete statement")
+
+    monkeypatch.setattr(UserRepositoryImpl, "delete", delete_then_fail)
+
+    async def scenario():
+        async with SqlAlchemyUnitOfWork(database) as uow:
+            await uow.users.delete(700)
+
+    with pytest.raises(PersistenceError):
+        _run(scenario())
+
+    assert _research_counts(database) == before
 
 
 def test_a_failure_during_deletion_rolls_the_whole_thing_back(populated, monkeypatch):

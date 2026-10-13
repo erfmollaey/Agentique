@@ -34,6 +34,13 @@ from app.domain.chat import (
 from app.domain.chat import (
     Message as ChatMessage,
 )
+from app.domain.research.ports import (
+    CitationRepository,
+    ClaimRepository,
+    ResearchRunRepository,
+    SourceChunkRepository,
+    SourceRepository,
+)
 
 
 @runtime_checkable
@@ -163,6 +170,11 @@ class UnitOfWork(Protocol):
     users: UserRepository
     conversations: ConversationRepository
     messages: MessageRepository
+    research_runs: ResearchRunRepository
+    sources: SourceRepository
+    source_chunks: SourceChunkRepository
+    claims: ClaimRepository
+    citations: CitationRepository
 
     async def __aenter__(self) -> UnitOfWork: ...
 

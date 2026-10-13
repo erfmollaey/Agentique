@@ -120,7 +120,8 @@ async def test_help_lists_the_available_commands(dispatcher, enqueued, sent):
 async def test_an_unknown_command_is_answered_not_treated_as_text(dispatcher, enqueued, sent):
     """FR-18."""
     dp, bot = dispatcher
-    await _feed(dp, bot, _update(text="/research something"))
+    # `/research` is a real command since P3.9-D, so a still-unknown one is needed.
+    await _feed(dp, bot, _update(text="/doesnotexist something"))
     assert enqueued == [], "an unknown command was treated as free text"
     assert len(sent) == 1
     assert "/help" in sent[0]["text"]

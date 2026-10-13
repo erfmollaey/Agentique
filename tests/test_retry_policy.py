@@ -186,6 +186,95 @@ def test_delivery_failure_is_translated_into_a_typed_error(settings):
         delivery.send(42, "anything")
 
 
+# --- the research failure family (Phase 3, P3.9-D) --------------------------
+
+
+def test_a_research_deadline_is_not_retryable():
+    """AD-045: the run stops; it does not re-execute to buy more time.
+
+    This is the single most consequential classification in the family, because
+    ``research_task`` reads ``retryable`` to decide whether to call ``self.retry``.
+    Without the explicit ``False`` the cooperative deadline would land in the retry
+    path and re-run the whole pipeline — which is exactly the failure AD-045
+    records as the reason Celery's soft limit could not be adopted as the mechanism.
+    """
+    from app.domain.errors import ResearchDeadlineError
+
+    assert ResearchDeadlineError("out of time").retryable is False
+
+
+def test_every_research_failure_maps_to_its_own_message():
+    """FR-43: the outcomes are distinguishable, not one generic notice.
+
+    § R.10 records that "no evidence found" and "the pipeline failed" converged on
+    one message, and § B5-P4 makes telling them apart a prerequisite of the deadline
+    policy. Each entry is asserted *distinct*, because two families sharing a
+    message would make them the same message to a user still.
+    """
+    from app.domain.errors import (
+        PlanningInputError,
+        ResearchDeadlineError,
+        ResearchNoEvidenceError,
+        ResearchPipelineError,
+        SynthesisInputError,
+    )
+
+    errors = (
+        ResearchNoEvidenceError("nothing verified"),
+        SynthesisInputError("empty registry"),
+        ResearchDeadlineError("deadline"),
+        ResearchPipelineError("pipeline"),
+        PlanningInputError("question too long"),
+    )
+    messages = [user_message_for(error) for error in errors]
+    assert len(set(messages)) == len(errors), (
+        "each research outcome needs its own user-facing message"
+    )
+
+
+def test_the_research_messages_reveal_nothing_internal():
+    """SR-12 / FR-42: no URL, hostname, stage name, or provider text.
+
+    The audit § S.5.2 records that ``PlanningInputError`` previously fell through to
+    ``GENERIC`` — including for an intake rejection whose message can only be the
+    truth about the user's own input.
+    """
+    from app.domain.errors import (
+        PlanningInputError,
+        ResearchDeadlineError,
+        ResearchNoEvidenceError,
+        ResearchPipelineError,
+        SynthesisInputError,
+    )
+
+    for exc in (
+        ResearchNoEvidenceError("source https://internal:5432 failed after 400ms"),
+        SynthesisInputError("registry empty for user 42"),
+        ResearchDeadlineError("stage 'fetch' exceeded 30s"),
+        ResearchPipelineError("brave returned 503"),
+        PlanningInputError("2300 chars exceeds PLAN_MAX_QUESTION_CHARS"),
+    ):
+        text = user_message_for(exc)
+        assert text != user_message_for(ResearchError("x")), "fell through to GENERIC"
+        for forbidden in ("internal", "5432", "400ms", "brave", "503", "fetch", "stage"):
+            assert forbidden not in text, f"{forbidden!r} leaked into {text!r}"
+
+
+def test_a_deadline_and_a_pipeline_failure_say_different_things():
+    """The distinction a user can act on.
+
+    "I stopped early, ask something narrower" and "I could not finish, try later"
+    lead to different next actions, so they must not be interchangeable strings.
+    """
+    from app.domain.errors import ResearchDeadlineError, ResearchPipelineError
+
+    deadline = user_message_for(ResearchDeadlineError("x")).lower()
+    pipeline = user_message_for(ResearchPipelineError("x")).lower()
+    assert "stopped" in deadline or "early" in deadline
+    assert "again shortly" in pipeline
+    assert deadline != pipeline
+
+
 class _BrokenBot:
     session = None
 

@@ -9,15 +9,83 @@
 > It describes the repository before Phase 1: "zero tests", "no service layer",
 > "no database code", active phase 1 *Not Started*. All of that is now wrong.
 >
-> **Read these instead, in this order, before writing code:**
+> **Read these instead, in this order, before writing code:** *(reading list updated 2026-10-07 for Phase 3)*
 > 1. [`docs/DEVELOPMENT_RULES.md`](../../../docs/DEVELOPMENT_RULES.md) — mandatory rules
-> 2. [`docs/PROJECT_PLAN.md`](../../../docs/PROJECT_PLAN.md) — active phase, status tables, decision log (AD-001 … AD-027)
-> 3. [`docs/phases/PHASE-02-AI-CHAT.md`](../../../docs/phases/PHASE-02-AI-CHAT.md) § 14 — current implementation record, limitations, and open blockers
-> 4. [`../../README.md`](../../README.md) — how to run it
+> 2. [`docs/PROJECT_PLAN.md`](../../../docs/PROJECT_PLAN.md) — active phase, status tables, decision log
+> 3. [`docs/phases/PHASE-03-RESEARCH-ENGINE.md`](../../../docs/phases/PHASE-03-RESEARCH-ENGINE.md) — the active phase; **§ 15 is the frozen P3.0 contract**: trigger UX, pipeline responsibilities, SSRF and prompt-injection boundaries, citation trust chain, data model, failure model. Do not write Research Engine code that violates it, and do not select a search provider ahead of P3.2
+> 4. [`docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md`](../../../docs/audits/PHASE-03_RESEARCH_ENGINE_AUDIT.md) — the read-only gap analysis the contract is based on
+> 5. [`docs/phases/PHASE-02-AI-CHAT.md`](../../../docs/phases/PHASE-02-AI-CHAT.md) § 14 — Phase 2 implementation record (complete)
+> 6. [`../../README.md`](../../README.md) — how to run it
 >
 > The audit content below is retained unmodified as the historical baseline. Its
 > line numbers and "NOT CONNECTED" diagrams describe code that no longer exists.
 > Everything below the line has not been updated and should be read as history.
+>
+> **Durable rules confirmed by later work (2026-10-09 stabilization pass):**
+>
+> - A test that needs the process's long-lived asyncio loop must be **synchronous** and
+>   drive its whole scenario through `tests/conftest.py::run_on_process_loop`. Never call
+>   it from inside a `pytest-asyncio` async test — the loop is already running and it
+>   raises `RuntimeError`. This is why the lifecycle concurrency test, like the chunk,
+>   evidence, and synthesis persistence tests, is `def`, not `async def`.
+> - Every `ResearchError` subclass must be constructible from a single positional message
+>   (`SomeError("x")`); `test_every_domain_failure_has_its_own_message` enforces it
+>   structurally. Richer construction belongs on a named classmethod, e.g.
+>   `FetchHTTPStatusError.for_status`.
+> - `ResearchRunRepositoryImpl.set_status` must keep its `SELECT ... FOR UPDATE` row
+>   lock. Without it the read-then-write is not atomic under READ COMMITTED and two
+>   concurrent transitions both apply.
+>
+> **P3.9-D (2026-10-10) — the research path exists; the historical audit below does
+> not describe it.** `/research <question>` is a real command: the handler
+> (`app/bot/handlers.py`) validates and throttles through
+> `RateLimiter.check_share`, `ResearchIntakeService.accept` creates the run
+> idempotently (derived `request_key`, migration `0005`), and one Celery task per
+> run (`app/tasks/research_pipeline_task.py::run_research(run_id, user_id, chat_id)`)
+> executes `ResearchOrchestrator.execute` on the worker's long-lived loop and
+> delivers exactly one terminal message. Rules that follow from it:
+>
+> - Any new write on a research run must be **ownership-scoped** (`user_id` in the
+>   WHERE clause) and go through the lifecycle; never relax the `SAME_STATE` /
+>   `TERMINAL_STATE` refusals — use `set_summary_note` for a status-free summary.
+> - Never call `run_on_process_loop`/`run_coroutine` from inside a running
+>   coroutine (handler, task-await paths): await directly. The process loop is for
+>   synchronous task bodies only.
+> - `RESEARCH_DEADLINE_SECONDS` defaults to `None` (unbounded) **on purpose**; no
+>   numeric deadline or rate-limit number may be invented — they are
+>   measurement-gated (audit § U.4).
+> - The evidence stage claims sources via `summary IS NULL` + `FOR UPDATE`; a
+>   re-executed run must skip claimed sources (`SourceAlreadyAnalyzedError`), not
+>   re-analyse or merge them.
+> - Do not add the global in-flight slot to research (`check_share` exists to avoid
+>   B6-P4's cross-process leak); that defect is reported, not fixed.
+>
+> **P3.10 (2026-10-13) — the user now receives citations, and the run has a cost
+> ledger.** Rules that follow from it:
+>
+> - `SynthesizedAnswer.plain_text` still carries **no** markers, and must not be
+>   changed to add them: the stored `final_answer` must keep matching the verified
+>   structure. Presentation lives in `app/services/research/rendering.py`, which
+>   renders only citations `verify_synthesis` already accepted. **Never invent a
+>   marker, URL, title, or source-to-claim mapping in the renderer** — it verifies
+>   nothing and must stay that way.
+> - Marker numbering is per **source**, not per citation, and markers are
+>   **section-level** (that is the granularity support was verified at). Both are
+>   asserted; changing either changes the citation contract, not a detail.
+> - `formatting.telegram_chunk_limit(...)` is the single definition of the message
+>   budget. The renderer and `DeliveryService` both read it — do not recompute a
+>   limit in either place.
+> - Per-run usage is recorded in `app/services/research/usage.py` by a
+>   **pass-through** wrapper around the shared provider. The composition root wraps
+>   it for the four research adapters only; `ChatService` keeps the raw client. Never
+>   estimate a token count — record only what the provider reported.
+> - `RESEARCH_DEADLINE_SECONDS` defaults to `None` (unbounded) **on purpose**; no
+>   numeric deadline, rate-limit figure, or cost budget may be invented — they are
+>   measurement-gated (audit § V.2, § V.5).
+> - `SEARCH_PROVIDER` defaults to **`tavily`** (AD-050). That is the recorded
+>   decision and it must not be reverted to `brave` on the assumption that the older
+>   AD-036 selection still applies; AD-036 is marked Superseded. Both adapters stay
+>   registered, so an override is still a settings change.
 
 ---
 
